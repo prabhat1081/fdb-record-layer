@@ -38,7 +38,7 @@ import com.apple.foundationdb.record.query.plan.PlannableIndexTypes;
 import com.apple.foundationdb.record.query.plan.QueryPlanner;
 import com.apple.foundationdb.record.query.plan.RecordQueryPlanner;
 import com.apple.foundationdb.record.query.plan.temp.RewritePlanner;
-import com.apple.foundationdb.subspace.Subspace;
+import com.google.common.collect.ImmutableMap;
 import com.google.protobuf.ByteString;
 import com.google.protobuf.Descriptors;
 import com.google.protobuf.Message;
@@ -49,6 +49,8 @@ import org.slf4j.LoggerFactory;
 import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
 import java.util.Arrays;
+import java.util.Map;
+import java.util.UUID;
 
 import static com.apple.foundationdb.record.metadata.Key.Expressions.concat;
 import static com.apple.foundationdb.record.metadata.Key.Expressions.field;
@@ -60,14 +62,22 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 public abstract class FDBRecordStoreTestBase extends FDBTestBase {
     private static final Logger logger = LoggerFactory.getLogger(FDBRecordStoreTestBase.class);
 
-    private static final Object[] PATH_OBJECTS = new Object[]{"record-test", "unit", "recordStore"};
+    protected static final Object[] PATH_OBJECTS = new Object[]{"record-test", "unit", "recordStore"};
 
     protected FDBDatabase fdb;
     protected FDBRecordStore recordStore;
     protected FDBStoreTimer timer = new FDBStoreTimer();
     protected boolean useRewritePlanner = false;
     protected QueryPlanner planner;
-    protected final KeySpacePath path = TestKeySpace.getKeyspacePath(PATH_OBJECTS);
+    protected final KeySpacePath path;
+
+    public FDBRecordStoreTestBase() {
+        this(PATH_OBJECTS);
+    }
+
+    public FDBRecordStoreTestBase(Object[] path) {
+        this.path = TestKeySpace.getKeyspacePath(path);
+    }
 
     /**
      * Meta data setup hook, used for testing.
@@ -88,17 +98,15 @@ public abstract class FDBRecordStoreTestBase extends FDBTestBase {
     }
 
     public FDBRecordContext openContext() {
-        FDBRecordContext context = fdb.openContext();
-        context.setTimer(timer);
-        return context;
+        Map<String, String> mdcContext = ImmutableMap.of("uuid", UUID.randomUUID().toString());
+        return fdb.openContext(mdcContext, timer);
     }
 
     @BeforeEach
     public void clearAndInitialize() {
         getFDB();
         fdb.run(timer, null, context -> {
-            Subspace subspace = path.toSubspace(context);
-            FDBRecordStore.deleteStore(context, subspace);
+            path.deleteAllData(context);
             return null;
         });
     }
@@ -136,7 +144,7 @@ public abstract class FDBRecordStoreTestBase extends FDBTestBase {
         }
     }
 
-    public void commit(FDBRecordContext context) throws Exception {
+    public void commit(FDBRecordContext context) {
         try {
             context.commit();
             if (logger.isInfoEnabled()) {
@@ -161,7 +169,7 @@ public abstract class FDBRecordStoreTestBase extends FDBTestBase {
         openSimpleRecordStore(context, NO_HOOK);
     }
 
-    public void openSimpleRecordStore(FDBRecordContext context, @Nullable RecordMetaDataHook hook) throws Exception {
+    public void openSimpleRecordStore(FDBRecordContext context, @Nullable RecordMetaDataHook hook) {
         createOrOpenRecordStore(context, simpleMetaData(hook));
     }
 
@@ -288,7 +296,7 @@ public abstract class FDBRecordStoreTestBase extends FDBTestBase {
         return recBuilder.build();
     }
 
-    protected FDBStoredRecord<Message> saveAndSplitSimpleRecord(long recno, String strValue, int numValue) throws Exception {
+    protected FDBStoredRecord<Message> saveAndSplitSimpleRecord(long recno, String strValue, int numValue) {
         FDBStoredRecord<Message> savedRecord;
         try (FDBRecordContext context = openContext()) {
             openSimpleRecordStore(context, TEST_SPLIT_HOOK);

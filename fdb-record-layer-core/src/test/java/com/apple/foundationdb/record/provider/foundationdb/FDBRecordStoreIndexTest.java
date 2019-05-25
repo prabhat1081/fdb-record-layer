@@ -23,14 +23,18 @@ package com.apple.foundationdb.record.provider.foundationdb;
 import com.apple.foundationdb.FDBException;
 import com.apple.foundationdb.Range;
 import com.apple.foundationdb.async.AsyncUtil;
+import com.apple.foundationdb.async.CloseableAsyncIterator;
 import com.apple.foundationdb.record.EvaluationContext;
+import com.apple.foundationdb.record.ExecuteProperties;
+import com.apple.foundationdb.record.ExecuteState;
 import com.apple.foundationdb.record.FunctionNames;
 import com.apple.foundationdb.record.IndexEntry;
 import com.apple.foundationdb.record.IndexScanType;
 import com.apple.foundationdb.record.IndexState;
 import com.apple.foundationdb.record.IsolationLevel;
+import com.apple.foundationdb.record.RecordCoreArgumentException;
 import com.apple.foundationdb.record.RecordCoreException;
-import com.apple.foundationdb.record.RecordCursor;
+import com.apple.foundationdb.record.RecordCursorIterator;
 import com.apple.foundationdb.record.RecordIndexUniquenessViolation;
 import com.apple.foundationdb.record.RecordMetaData;
 import com.apple.foundationdb.record.RecordMetaDataBuilder;
@@ -41,6 +45,8 @@ import com.apple.foundationdb.record.TestNoIndexesProto;
 import com.apple.foundationdb.record.TestRecords1Proto;
 import com.apple.foundationdb.record.TestRecordsIndexFilteringProto;
 import com.apple.foundationdb.record.TupleRange;
+import com.apple.foundationdb.record.cursors.AutoContinuingCursor;
+import com.apple.foundationdb.record.cursors.LazyCursor;
 import com.apple.foundationdb.record.metadata.Index;
 import com.apple.foundationdb.record.metadata.IndexAggregateFunction;
 import com.apple.foundationdb.record.metadata.IndexOptions;
@@ -55,14 +61,19 @@ import com.apple.foundationdb.record.metadata.expressions.KeyExpression;
 import com.apple.foundationdb.record.metadata.expressions.KeyExpression.FanType;
 import com.apple.foundationdb.record.metadata.expressions.ThenKeyExpression;
 import com.apple.foundationdb.record.provider.common.StoreTimer;
+import com.apple.foundationdb.record.provider.foundationdb.indexes.InvalidIndexEntry;
 import com.apple.foundationdb.record.query.expressions.Query;
 import com.apple.foundationdb.tuple.Tuple;
 import com.apple.foundationdb.tuple.TupleHelpers;
 import com.apple.test.Tags;
+import com.google.common.base.Strings;
 import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.Iterators;
 import com.google.protobuf.Message;
+import org.apache.commons.lang3.tuple.Pair;
 import org.hamcrest.Description;
 import org.hamcrest.TypeSafeMatcher;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -70,23 +81,35 @@ import org.junit.jupiter.params.provider.EnumSource;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
+import java.util.Random;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
 
 import static com.apple.foundationdb.record.metadata.Key.Expressions.concat;
 import static com.apple.foundationdb.record.metadata.Key.Expressions.concatenateFields;
 import static com.apple.foundationdb.record.metadata.Key.Expressions.field;
 import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.greaterThanOrEqualTo;
+import static org.hamcrest.Matchers.hasEntry;
 import static org.hamcrest.Matchers.instanceOf;
 import static org.hamcrest.Matchers.is;
 import static org.hamcrest.Matchers.isOneOf;
+import static org.hamcrest.Matchers.lessThanOrEqualTo;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -103,6 +126,12 @@ import static org.junit.jupiter.api.Assertions.fail;
 @Tag(Tags.RequiresFDB)
 public class FDBRecordStoreIndexTest extends FDBRecordStoreTestBase {
     private static final Logger logger = LoggerFactory.getLogger(FDBRecordStoreIndexTest.class);
+
+    @BeforeEach
+    public void init() {
+        // Clear the cached databases.
+        FDBDatabaseFactory.instance().clear();
+    }
 
     @Test
     public void uniqueness() throws Exception {
@@ -951,6 +980,67 @@ public class FDBRecordStoreIndexTest extends FDBRecordStoreTestBase {
     }
 
     @Test
+    public void deleteAllRecordsPreservesIndexStates() throws Exception {
+        final String disabledIndex = "MySimpleRecord$num_value_3_indexed";
+        final String writeOnlyIndex = "MySimpleRecord$str_value_indexed";
+        TestRecords1Proto.MySimpleRecord testRecord = TestRecords1Proto.MySimpleRecord.newBuilder()
+                .setRecNo(1066L)
+                .setNumValue3Indexed(42)
+                .setStrValueIndexed("forty-two")
+                .build();
+
+        try (FDBRecordContext context = openContext()) {
+            openSimpleRecordStore(context);
+            recordStore.markIndexDisabled(disabledIndex).get();
+            recordStore.markIndexWriteOnly(writeOnlyIndex).get();
+            recordStore.saveRecord(testRecord);
+            commit(context);
+        }
+
+        // Ensure that the index states are preserved as visible from within the
+        // uncommitted transaction.
+        try (FDBRecordContext context = openContext()) {
+            openSimpleRecordStore(context);
+            assertTrue(recordStore.isIndexDisabled(disabledIndex));
+            assertTrue(recordStore.isIndexWriteOnly(writeOnlyIndex));
+            assertTrue(recordStore.recordExists(Tuple.from(1066L)));
+
+            recordStore.deleteAllRecords();
+            assertTrue(recordStore.isIndexDisabled(disabledIndex));
+            assertTrue(recordStore.isIndexWriteOnly(writeOnlyIndex));
+            assertFalse(recordStore.recordExists(Tuple.from(1066L)));
+            commit(context);
+        }
+
+        // Ensure that this is still true after the transaction commits.
+        try (FDBRecordContext context = openContext()) {
+            openSimpleRecordStore(context);
+            assertTrue(recordStore.isIndexDisabled(disabledIndex));
+            assertTrue(recordStore.isIndexWriteOnly(writeOnlyIndex));
+            assertFalse(recordStore.recordExists(Tuple.from(1066L)));
+        }
+
+        // Rebuild all indexes to reset the index states.
+        try (FDBRecordContext context = openContext()) {
+            openSimpleRecordStore(context);
+            assertTrue(recordStore.isIndexDisabled(disabledIndex));
+            assertTrue(recordStore.isIndexWriteOnly(writeOnlyIndex));
+            recordStore.rebuildAllIndexes().get();
+            assertTrue(recordStore.isIndexReadable(disabledIndex));
+            assertTrue(recordStore.isIndexReadable(writeOnlyIndex));
+            commit(context);
+        }
+
+        // Verify that the index states are, in fact, updated.
+        try (FDBRecordContext context = openContext()) {
+            openSimpleRecordStore(context);
+            assertTrue(recordStore.isIndexReadable(disabledIndex));
+            assertTrue(recordStore.isIndexReadable(writeOnlyIndex));
+            commit(context);
+        }
+    }
+
+    @Test
     public void insertTerrible() throws Exception {
         RecordMetaDataHook hook = metaDataBuilder -> {
             metaDataBuilder.addIndex("MySimpleRecord", new Index("value3$terrible", field("num_value_3_indexed"), "terrible"));
@@ -1111,7 +1201,6 @@ public class FDBRecordStoreIndexTest extends FDBRecordStoreTestBase {
         try (FDBRecordContext context = openContext()) {
             openSimpleRecordStore(context);
             RecordStoreState storeState = recordStore.getRecordStoreState();
-            assertEquals(new RecordStoreState(Collections.singletonMap(indexName, IndexState.DISABLED)), storeState);
             assertEquals(IndexState.DISABLED, storeState.getState(indexName));
         }
     }
@@ -1168,32 +1257,84 @@ public class FDBRecordStoreIndexTest extends FDBRecordStoreTestBase {
 
         try (FDBRecordContext context = openContext()) {
             openSimpleRecordStore(context);
-            assertThat(recordStore.isIndexWriteOnly(indexName), is(false));
+            assertFalse(recordStore.isIndexWriteOnly(indexName));
             recordStore.markIndexWriteOnly(indexName).get();
-            assertThat(recordStore.isIndexWriteOnly(indexName), is(true));
-            context.commit();
+            assertTrue(recordStore.isIndexWriteOnly(indexName));
+            commit(context);
         }
 
-        RecordMetaData metaData;
         try (FDBRecordContext context = openContext()) {
             openSimpleRecordStore(context);
-            metaData = recordStore.getRecordMetaData();
+            assertTrue(recordStore.isIndexWriteOnly(indexName));
         }
-
-        assertEquals(new RecordStoreState(Collections.singletonMap(indexName, IndexState.WRITE_ONLY)), recordStore.getRecordStoreState());
 
         try (FDBRecordContext context = openContext()) {
             openSimpleRecordStore(context);
             recordStore.rebuildIndex(recordStore.getRecordMetaData().getIndex(indexName), null, FDBRecordStore.RebuildIndexReason.TEST).get();
-            assertThat(recordStore.isIndexReadable(indexName), is(true));
-            context.commit();
+            assertTrue(recordStore.isIndexReadable(indexName));
+            commit(context);
         }
 
         try (FDBRecordContext context = openContext()) {
             openSimpleRecordStore(context);
-            assertEquals(RecordStoreState.EMPTY, recordStore.getRecordStoreState());
-            assertEquals(RecordStoreState.EMPTY, recordStore.getRecordStoreState());
+            assertTrue(recordStore.getRecordStoreState().allIndexesReadable());
             assertTrue(recordStore.getRecordStoreState().compatibleWith(recordStore.getRecordStoreState()));
+        }
+    }
+
+    @Test
+    public void rebuildAll() throws Exception {
+        final String disabledIndex = "MySimpleRecord$str_value_indexed";
+        final String writeOnlyIndex = "MySimpleRecord$num_value_3_indexed";
+
+        TestRecords1Proto.MySimpleRecord record = TestRecords1Proto.MySimpleRecord.newBuilder()
+                .setRecNo(1066)
+                .setStrValueIndexed("indexed_string")
+                .setNumValue3Indexed(42)
+                .build();
+
+        try (FDBRecordContext context = openContext()) {
+            openSimpleRecordStore(context);
+            assertTrue(recordStore.isIndexReadable(disabledIndex));
+            assertTrue(recordStore.isIndexReadable(writeOnlyIndex));
+            recordStore.markIndexDisabled(disabledIndex).get();
+            recordStore.markIndexWriteOnly(writeOnlyIndex).get();
+            assertTrue(recordStore.isIndexDisabled(disabledIndex));
+            assertTrue(recordStore.isIndexWriteOnly(writeOnlyIndex));
+            recordStore.saveRecord(record);
+            commit(context);
+        }
+
+        // Verify the write-only index was updated and the disabled one was not
+        try (FDBRecordContext context = openContext()) {
+            openSimpleRecordStore(context);
+            recordStore.uncheckedMarkIndexReadable(disabledIndex).get();
+            recordStore.uncheckedMarkIndexReadable(writeOnlyIndex).get();
+            assertEquals(Collections.emptyList(),
+                    recordStore.scanIndexRecords(disabledIndex).map(FDBIndexedRecord::getRecord).asList().get());
+            assertEquals(Collections.singletonList(record),
+                    recordStore.scanIndexRecords(writeOnlyIndex).map(FDBIndexedRecord::getRecord).asList().get());
+            // do not commit
+        }
+
+        try (FDBRecordContext context = openContext()) {
+            openSimpleRecordStore(context);
+            recordStore.rebuildAllIndexes().get();
+            assertTrue(recordStore.isIndexReadable(disabledIndex));
+            assertTrue(recordStore.isIndexReadable(writeOnlyIndex));
+            assertEquals(Collections.singletonList(record),
+                    recordStore.scanIndexRecords(disabledIndex).map(FDBIndexedRecord::getRecord).asList().get());
+            assertEquals(Collections.singletonList(record),
+                    recordStore.scanIndexRecords(writeOnlyIndex).map(FDBIndexedRecord::getRecord).asList().get());
+            commit(context);
+        }
+
+        // Validate that the index state updates carry over into the next transaction
+        try (FDBRecordContext context = openContext()) {
+            openSimpleRecordStore(context);
+            assertTrue(recordStore.isIndexReadable(disabledIndex));
+            assertTrue(recordStore.isIndexReadable(writeOnlyIndex));
+            assertTrue(recordStore.getRecordStoreState().allIndexesReadable());
         }
     }
 
@@ -1272,6 +1413,44 @@ public class FDBRecordStoreIndexTest extends FDBRecordStoreTestBase {
     }
 
     @Test
+    public void getIndexStates() throws Exception {
+        final String indexName = "MySimpleRecord$str_value_indexed";
+
+        try (FDBRecordContext context = openContext()) {
+            openSimpleRecordStore(context);
+            final Index index = recordStore.getRecordMetaData().getIndex(indexName);
+            assertThat(recordStore.getAllIndexStates(), hasEntry(index, IndexState.READABLE));
+            recordStore.markIndexWriteOnly(indexName).get();
+            assertThat(recordStore.getAllIndexStates(), hasEntry(index, IndexState.WRITE_ONLY));
+            context.commit();
+        }
+
+        try (FDBRecordContext context = openContext()) {
+            openSimpleRecordStore(context);
+            final Index index = recordStore.getRecordMetaData().getIndex(indexName);
+            assertThat(recordStore.getAllIndexStates(), hasEntry(index, IndexState.WRITE_ONLY));
+            recordStore.markIndexDisabled(indexName).get();
+            assertThat(recordStore.getAllIndexStates(), hasEntry(index, IndexState.DISABLED));
+            // does not commit
+        }
+
+        try (FDBRecordContext context = openContext()) {
+            openSimpleRecordStore(context);
+            final Index index = recordStore.getRecordMetaData().getIndex(indexName);
+            assertThat(recordStore.getAllIndexStates(), hasEntry(index, IndexState.WRITE_ONLY));
+            recordStore.saveRecord(TestRecords1Proto.MyOtherRecord.newBuilder()
+                    .setRecNo(2)
+                    .build()); // so that it will conflict on commit
+            try (FDBRecordContext context2 = openContext()) {
+                openSimpleRecordStore(context2);
+                recordStore.markIndexReadable(indexName).get();
+                context2.commit();
+            }
+            assertThrows(FDBExceptions.FDBStoreTransactionConflictException.class, context::commit);
+        }
+    }
+
+    @Test
     public void failUpdateConcurrentWithStateChange() throws Exception {
         final String indexName = "MySimpleRecord$str_value_indexed";
 
@@ -1332,7 +1511,7 @@ public class FDBRecordStoreIndexTest extends FDBRecordStoreTestBase {
 
         try (FDBRecordContext context = openContext()) {
             openSimpleRecordStore(context);
-            RecordCursor<RecordIndexUniquenessViolation> cursor = recordStore.scanUniquenessViolations(index);
+            RecordCursorIterator<RecordIndexUniquenessViolation> cursor = recordStore.scanUniquenessViolations(index).asIterator();
 
             assertTrue(cursor.hasNext());
             RecordIndexUniquenessViolation first = cursor.next();
@@ -1351,7 +1530,8 @@ public class FDBRecordStoreIndexTest extends FDBRecordStoreTestBase {
 
         try (FDBRecordContext context = openContext()) {
             openSimpleRecordStore(context);
-            RecordCursor<RecordIndexUniquenessViolation> cursor = recordStore.scanUniquenessViolations(index, Key.Evaluated.scalar(42));
+            RecordCursorIterator<RecordIndexUniquenessViolation> cursor = recordStore.scanUniquenessViolations(index, Key.Evaluated.scalar(42))
+                    .asIterator();
 
             assertTrue(cursor.hasNext());
             RecordIndexUniquenessViolation first = cursor.next();
@@ -1378,7 +1558,7 @@ public class FDBRecordStoreIndexTest extends FDBRecordStoreTestBase {
 
         try (FDBRecordContext context = openContext()) {
             openSimpleRecordStore(context);
-            RecordCursor<RecordIndexUniquenessViolation> cursor = recordStore.scanUniquenessViolations(index);
+            RecordCursorIterator<RecordIndexUniquenessViolation> cursor = recordStore.scanUniquenessViolations(index).asIterator();
             assertFalse(cursor.hasNext());
 
             // reintroduce the error
@@ -1389,7 +1569,8 @@ public class FDBRecordStoreIndexTest extends FDBRecordStoreTestBase {
 
         try (FDBRecordContext context = openContext()) {
             openSimpleRecordStore(context);
-            RecordCursor<RecordIndexUniquenessViolation> cursor = recordStore.scanUniquenessViolations(index, Key.Evaluated.scalar(42));
+            RecordCursorIterator<RecordIndexUniquenessViolation> cursor = recordStore.scanUniquenessViolations(index, Key.Evaluated.scalar(42))
+                    .asIterator();
 
             assertTrue(cursor.hasNext());
             RecordIndexUniquenessViolation first = cursor.next();
@@ -1409,7 +1590,7 @@ public class FDBRecordStoreIndexTest extends FDBRecordStoreTestBase {
             assertNull(recordStore.loadRecord(Tuple.from(1066L)));
             assertNull(recordStore.loadRecord(Tuple.from(1793L)));
 
-            cursor = recordStore.scanUniquenessViolations(index);
+            cursor = recordStore.scanUniquenessViolations(index).asIterator();
             assertFalse(cursor.hasNext());
         }
     }
@@ -1455,7 +1636,9 @@ public class FDBRecordStoreIndexTest extends FDBRecordStoreTestBase {
             assertEquals(2, (int)recordStore.scanUniquenessViolations(index, Key.Evaluated.scalar(2)).getCount().get());
             assertEquals(3, (int)recordStore.scanUniquenessViolations(index, Key.Evaluated.scalar(3)).getCount().get());
 
-            RecordCursor<RecordIndexUniquenessViolation> cursor = recordStore.scanUniquenessViolations(index, Key.Evaluated.scalar(3));
+            RecordCursorIterator<RecordIndexUniquenessViolation> cursor = recordStore
+                    .scanUniquenessViolations(index, Key.Evaluated.scalar(3))
+                    .asIterator();
 
             assertTrue(cursor.hasNext());
             RecordIndexUniquenessViolation next = cursor.next();
@@ -1477,7 +1660,7 @@ public class FDBRecordStoreIndexTest extends FDBRecordStoreTestBase {
 
             assertFalse(cursor.hasNext());
 
-            cursor = recordStore.scanUniquenessViolations(index, Key.Evaluated.scalar(2));
+            cursor = recordStore.scanUniquenessViolations(index, Key.Evaluated.scalar(2)).asIterator();
 
             assertTrue(cursor.hasNext());
             next = cursor.next();
@@ -1509,7 +1692,7 @@ public class FDBRecordStoreIndexTest extends FDBRecordStoreTestBase {
             openSimpleRecordStore(context, hook);
             recordStore.resolveUniquenessViolation(index, Tuple.from(3), Tuple.from(1066L)).get();
 
-            RecordCursor<RecordIndexUniquenessViolation> cursor = recordStore.scanUniquenessViolations(index);
+            RecordCursorIterator<RecordIndexUniquenessViolation> cursor = recordStore.scanUniquenessViolations(index).asIterator();
             assertTrue(cursor.hasNext());
             RecordIndexUniquenessViolation next = cursor.next();
             assertEquals(Tuple.from(2L), next.getIndexEntry().getKey());
@@ -1529,7 +1712,7 @@ public class FDBRecordStoreIndexTest extends FDBRecordStoreTestBase {
             openSimpleRecordStore(context, hook);
             recordStore.resolveUniquenessViolation(index, Tuple.from(3), Tuple.from(1793L)).get();
 
-            RecordCursor<RecordIndexUniquenessViolation> cursor = recordStore.scanUniquenessViolations(index);
+            RecordCursorIterator<RecordIndexUniquenessViolation> cursor = recordStore.scanUniquenessViolations(index).asIterator();
             assertTrue(cursor.hasNext());
             RecordIndexUniquenessViolation next = cursor.next();
             assertEquals(Tuple.from(2L), next.getIndexEntry().getKey());
@@ -1665,7 +1848,7 @@ public class FDBRecordStoreIndexTest extends FDBRecordStoreTestBase {
         }
     }
 
-
+    @Test
     public void invalidIndexField() throws Exception {
         assertThrows(KeyExpression.InvalidExpressionException.class, () ->
                 testInvalidIndex(new Index("broken", field("no_such_field"))));
@@ -1965,15 +2148,13 @@ public class FDBRecordStoreIndexTest extends FDBRecordStoreTestBase {
             uncheckedOpenSimpleRecordStore(context);
 
             // Verify our entries
+            Index index = recordStore.getRecordMetaData().getIndex("MySimpleRecord$str_value_indexed");
             assertTrue(recordStore.hasIndexEntryRecord(
-                    recordStore.getRecordMetaData().getIndex("MySimpleRecord$str_value_indexed"),
-                    new IndexEntry(Tuple.from("foo", 1), TupleHelpers.EMPTY), IsolationLevel.SERIALIZABLE).get(), "'Foo' should exist");
+                    new IndexEntry(index, Tuple.from("foo", 1), TupleHelpers.EMPTY), IsolationLevel.SERIALIZABLE).get(), "'Foo' should exist");
             assertFalse(recordStore.hasIndexEntryRecord(
-                    recordStore.getRecordMetaData().getIndex("MySimpleRecord$str_value_indexed"),
-                    new IndexEntry(Tuple.from("bar", 2), TupleHelpers.EMPTY), IsolationLevel.SERIALIZABLE).get(), "'Bar' should be deleted");
+                    new IndexEntry(index, Tuple.from("bar", 2), TupleHelpers.EMPTY), IsolationLevel.SERIALIZABLE).get(), "'Bar' should be deleted");
             assertTrue(recordStore.hasIndexEntryRecord(
-                    recordStore.getRecordMetaData().getIndex("MySimpleRecord$str_value_indexed"),
-                    new IndexEntry(Tuple.from("baz", 3), TupleHelpers.EMPTY), IsolationLevel.SERIALIZABLE).get(), "'Baz' should exist");
+                    new IndexEntry(index, Tuple.from("baz", 3), TupleHelpers.EMPTY), IsolationLevel.SERIALIZABLE).get(), "'Baz' should exist");
 
             try {
                 recordStore.scanIndexRecords("MySimpleRecord$str_value_indexed").asList().get();
@@ -2017,6 +2198,161 @@ public class FDBRecordStoreIndexTest extends FDBRecordStoreTestBase {
                         "Entry for '" + record.getIndexEntry().getKey() + "' should have an associated record");
             }
             commit(context);
+        }
+
+        // Validate the index. Should only return the index entry that has no associated record.
+        try (FDBRecordContext context = openContext()) {
+            uncheckedOpenSimpleRecordStore(context);
+            final Index index = recordStore.getRecordMetaData().getIndex("MySimpleRecord$str_value_indexed");
+            final List<InvalidIndexEntry> invalidIndexEntries = recordStore.getIndexMaintainer(index)
+                    .validateEntries(null, null)
+                    .asList().get();
+            assertEquals(
+                    Collections.singletonList(new InvalidIndexEntry(
+                            new IndexEntry(index, Tuple.from("bar", 2), TupleHelpers.EMPTY),
+                            InvalidIndexEntry.Reasons.ORPHAN)),
+                    invalidIndexEntries,
+                    "Validation should return the index entry that has no associated record.");
+            commit(context);
+        }
+    }
+
+    private Set<IndexEntry> setUpIndexOrphanValidation() throws Exception {
+        final int nRecords = 20;
+        try (FDBRecordContext context = openContext()) {
+            uncheckedOpenSimpleRecordStore(context);
+
+            for (int i = 0; i < nRecords; i++) {
+                TestRecords1Proto.MySimpleRecord.Builder recBuilder = TestRecords1Proto.MySimpleRecord.newBuilder();
+                recBuilder.setRecNo(i);
+                recBuilder.setStrValueIndexed(Integer.toString(i));
+                recordStore.saveRecord(recBuilder.build());
+            }
+            commit(context);
+        }
+
+        // Delete the even numbered records with the index removed.
+        Set<IndexEntry> expectedInvalidEntries = new HashSet<>();
+        try (FDBRecordContext context = openContext()) {
+            final Index index = recordStore.getRecordMetaData().getIndex("MySimpleRecord$str_value_indexed");
+            uncheckedOpenSimpleRecordStore(context, builder ->
+                    builder.removeIndex("MySimpleRecord$str_value_indexed"));
+            for (int i = 0; i < nRecords; i += 2) {
+                recordStore.deleteRecord(Tuple.from(i));
+                expectedInvalidEntries.add(new IndexEntry(index, Tuple.from(Integer.toString(i), i), TupleHelpers.EMPTY));
+            }
+            commit(context);
+        }
+
+        return expectedInvalidEntries;
+    }
+
+    @Test
+    public void testIndexOrphanValidationByIterations() throws Exception {
+        Set<IndexEntry> expectedInvalidEntries = setUpIndexOrphanValidation();
+
+        // Validate the index. Should only return the index entry that has no associated record.
+        final Random random = new Random();
+        byte[] continuation = null;
+        Set<IndexEntry> results = new HashSet<>();
+        do {
+            int limit = random.nextInt(4) + 1; // 1, 2, 3, or 4.
+            try (FDBRecordContext context = openContext()) {
+                uncheckedOpenSimpleRecordStore(context);
+                final Index index = recordStore.getRecordMetaData().getIndex("MySimpleRecord$str_value_indexed");
+                final RecordCursorIterator<InvalidIndexEntry> cursor = recordStore.getIndexMaintainer(index)
+                        .validateEntries(continuation, null)
+                        .limitRowsTo(limit)
+                        .asIterator();
+                while (cursor.hasNext()) {
+                    InvalidIndexEntry invalidIndexEntry = cursor.next();
+                    assertEquals(InvalidIndexEntry.Reasons.ORPHAN, invalidIndexEntry.getReason());
+                    IndexEntry entry = invalidIndexEntry.getEntry();
+                    assertFalse(results.contains(entry), "Entry " + entry + " is duplicated");
+                    results.add(entry);
+                }
+                continuation = cursor.getContinuation();
+                commit(context);
+            }
+        } while (continuation != null);
+        assertEquals(expectedInvalidEntries, results,
+                "Validation should return the index entry that has no associated record.");
+
+    }
+
+    @Test
+    public void testIndexOrphanValidationByAutoContinuingCursor() throws Exception {
+        Set<IndexEntry> expectedInvalidEntries = setUpIndexOrphanValidation();
+
+        try (FDBDatabaseRunner runner = fdb.newRunner()) {
+            AtomicInteger generatorCount = new AtomicInteger();
+            // Set a scanned records limit to mock when the transaction is out of band.
+            RecordCursorIterator<InvalidIndexEntry> cursor = new AutoContinuingCursor<>(
+                    runner,
+                    (context, continuation) -> new LazyCursor<>(
+                            FDBRecordStore.newBuilder()
+                                    .setContext(context).setKeySpacePath(path).setMetaDataProvider(simpleMetaData(NO_HOOK))
+                                    .uncheckedOpenAsync()
+                                    .thenApply(currentRecordStore -> {
+                                        generatorCount.getAndIncrement();
+                                        final Index index = currentRecordStore.getRecordMetaData()
+                                                .getIndex("MySimpleRecord$str_value_indexed");
+                                        ScanProperties scanProperties = new ScanProperties(ExecuteProperties.newBuilder()
+                                                .setReturnedRowLimit(Integer.MAX_VALUE)
+                                                .setIsolationLevel(IsolationLevel.SNAPSHOT)
+                                                .setScannedRecordsLimit(4)
+                                                .build());
+                                        return currentRecordStore.getIndexMaintainer(index)
+                                                .validateEntries(continuation, scanProperties);
+                                    })
+                    )
+            ).asIterator();
+
+            Set<IndexEntry> results = new HashSet<>();
+            while (cursor.hasNext()) {
+                InvalidIndexEntry invalidIndexEntry = cursor.next();
+                assertEquals(InvalidIndexEntry.Reasons.ORPHAN, invalidIndexEntry.getReason());
+                IndexEntry entry = invalidIndexEntry.getEntry();
+                assertFalse(results.contains(entry), "Entry " + entry + " is duplicated");
+                results.add(entry);
+            }
+            assertEquals(20 / 4 + 1, generatorCount.get());
+            assertEquals(expectedInvalidEntries, results,
+                    "Validation should return the index entry that has no associated record.");
+        }
+    }
+
+    @SuppressWarnings("deprecation") // testing deprecated method
+    @Test
+    public void loadEntryFromWrongIndex() throws Exception {
+        try (FDBRecordContext context = openContext()) {
+            openSimpleRecordStore(context);
+            Index strValueIndex = recordStore.getRecordMetaData().getIndex("MySimpleRecord$str_value_indexed");
+            IndexEntry entry = new IndexEntry(strValueIndex, Tuple.from("bar", 1066L), TupleHelpers.EMPTY);
+            Index numValue3Index = recordStore.getRecordMetaData().getIndex("MySimpleRecord$num_value_3_indexed");
+            RecordCoreArgumentException e = assertThrows(RecordCoreArgumentException.class, () ->
+                    context.asyncToSync(FDBStoreTimer.Waits.WAIT_LOAD_RECORD, recordStore.loadIndexEntryRecord(numValue3Index, entry, IndexOrphanBehavior.SKIP))
+            );
+            assertThat(e.getMessage(), containsString("index entry's index MySimpleRecord$str_value_indexed differs from specified index MySimpleRecord$num_value_3_indexed"));
+            e = assertThrows(RecordCoreArgumentException.class, () ->
+                    context.asyncToSync(FDBStoreTimer.Waits.WAIT_LOAD_RECORD, recordStore.loadIndexEntryRecord(numValue3Index, entry, IndexOrphanBehavior.SKIP, ExecuteState.NO_LIMITS))
+            );
+            assertThat(e.getMessage(), containsString("index entry's index MySimpleRecord$str_value_indexed differs from specified index MySimpleRecord$num_value_3_indexed"));
+        }
+    }
+
+    @SuppressWarnings("deprecation") // testing deprecated method
+    @Test
+    public void hasEntryFromWrongIndex() throws Exception {
+        try (FDBRecordContext context = openContext()) {
+            openSimpleRecordStore(context);
+            Index strValueIndex = recordStore.getRecordMetaData().getIndex("MySimpleRecord$str_value_indexed");
+            IndexEntry entry = new IndexEntry(strValueIndex, Tuple.from("bar", 1066L), TupleHelpers.EMPTY);
+            Index numValue3Index = recordStore.getRecordMetaData().getIndex("MySimpleRecord$num_value_3_indexed");
+            RecordCoreArgumentException e = assertThrows(RecordCoreArgumentException.class, () ->
+                    context.asyncToSync(FDBStoreTimer.Waits.WAIT_RECORD_EXISTS, recordStore.hasIndexEntryRecord(numValue3Index, entry, IsolationLevel.SERIALIZABLE))
+            );
+            assertThat(e.getMessage(), containsString("index entry's index MySimpleRecord$str_value_indexed differs from specified index MySimpleRecord$num_value_3_indexed"));
         }
     }
 
@@ -2073,5 +2409,228 @@ public class FDBRecordStoreIndexTest extends FDBRecordStoreTestBase {
             context.commit();
         }
     }
-    
+
+    @Test
+    public void testBoundaryPrimaryKeys() {
+        runLocalityTest(() -> testBoundaryPrimaryKeysImpl());
+    }
+
+    public void testBoundaryPrimaryKeysImpl() {
+        final FDBDatabaseFactory factory = FDBDatabaseFactory.instance();
+        factory.setLocalityProvider(MockedLocalityUtil.instance());
+        FDBDatabase database = FDBDatabaseFactory.instance().getDatabase();
+
+        final String indexName = "MySimpleRecord$num_value_unique";
+        try (FDBRecordContext context = database.openContext()) {
+            openSimpleRecordStore(context, TEST_SPLIT_HOOK);
+            recordStore.markIndexWriteOnly(indexName).join();
+            commit(context);
+        }
+
+        ArrayList<byte[]> keys = new ArrayList<>();
+        String bigOlString = Strings.repeat("x", SplitHelper.SPLIT_RECORD_SIZE + 2);
+        for (int i = 0; i < 50; i++) {
+            saveAndSplitSimpleRecord(i, bigOlString, i);
+            keys.add(recordStore.recordsSubspace().pack(i));
+        }
+
+        OnlineIndexer indexer;
+        List<Tuple> boundaryPrimaryKeys;
+        TupleRange range;
+        try (FDBRecordContext context = database.openContext()) {
+            openSimpleRecordStore(context, TEST_SPLIT_HOOK);
+            MockedLocalityUtil.init(keys, new Random().nextInt(keys.size() - 2) + 3); // 3 <= rangeCount <= size
+            Index index = recordStore.getRecordMetaData().getIndex(indexName);
+
+            // The indexer only uses recordStore as a prototype so does not require the original record store is still
+            // active.
+            indexer = OnlineIndexer.newBuilder()
+                    .setDatabase(database).setRecordStore(recordStore).setIndex(index)
+                    .build();
+
+            range = recordStore.context.asyncToSync(FDBStoreTimer.Waits.WAIT_BUILD_ENDPOINTS,
+                    indexer.buildEndpoints());
+
+            logger.info("The endpoints are " + range);
+
+            boundaryPrimaryKeys = recordStore.context.asyncToSync(FDBStoreTimer.Waits.WAIT_GET_BOUNDARY,
+                    recordStore.getPrimaryKeyBoundaries(range.getLow(), range.getHigh()).asList());
+
+            logger.info("The boundary primary keys are " + boundaryPrimaryKeys);
+
+            commit(context);
+        }
+
+        int boundaryPrimaryKeysSize = boundaryPrimaryKeys.size();
+        assertTrue(boundaryPrimaryKeysSize > 2,
+                "the test is meaningless if the records are not across boundaries");
+        assertThat( boundaryPrimaryKeys.get(0), greaterThanOrEqualTo(Tuple.from(-25L * 39)));
+        assertThat( boundaryPrimaryKeys.get(boundaryPrimaryKeysSize - 1), lessThanOrEqualTo(Tuple.from(24L * 39)));
+        assertEquals(boundaryPrimaryKeys.stream().sorted().distinct().collect(Collectors.toList()), boundaryPrimaryKeys,
+                "the list should be sorted without duplication.");
+        for (Tuple boundaryPrimaryKey : boundaryPrimaryKeys) {
+            assertEquals(1, boundaryPrimaryKey.size(), "primary keys should be a single value");
+        }
+
+        // Test splitIndexBuildRange.
+        assertEquals(1, indexer.splitIndexBuildRange(Integer.MAX_VALUE, Integer.MAX_VALUE).size(),
+                "the range is not split when it cannot be split to at least minSplit ranges");
+        checkSplitIndexBuildRange(1, 2, null, indexer); // to test splitting into fewer than the default number of split points
+        checkSplitIndexBuildRange(boundaryPrimaryKeysSize / 2, boundaryPrimaryKeysSize - 2, null, indexer); // to test splitting into fewer than the default number of split points
+        checkSplitIndexBuildRange(boundaryPrimaryKeysSize / 2, boundaryPrimaryKeysSize, null, indexer);
+
+        List<Pair<Tuple, Tuple>> oneRangePerSplit = getOneRangePerSplit(range, boundaryPrimaryKeys);
+        checkSplitIndexBuildRange(boundaryPrimaryKeysSize / 2, boundaryPrimaryKeysSize + 1, oneRangePerSplit, indexer); // to test exactly one range for each split
+        checkSplitIndexBuildRange(boundaryPrimaryKeysSize / 2, boundaryPrimaryKeysSize + 2, oneRangePerSplit, indexer);
+        checkSplitIndexBuildRange(boundaryPrimaryKeysSize / 2, Integer.MAX_VALUE, oneRangePerSplit, indexer); // to test that integer overflow isn't a problem
+
+        indexer.close();
+        database.close();
+    }
+
+    @Test
+    public void testNoBoundaryPrimaryKeys() {
+        runLocalityTest(() -> testNoBoundaryPrimaryKeysImpl());
+    }
+
+    public void testNoBoundaryPrimaryKeysImpl() {
+        final FDBDatabaseFactory factory = FDBDatabaseFactory.instance();
+        factory.setLocalityProvider(MockedLocalityUtil.instance());
+        FDBDatabase database = FDBDatabaseFactory.instance().getDatabase();
+
+        final String indexName = "MySimpleRecord$num_value_unique";
+        try (FDBRecordContext context = database.openContext()) {
+            openSimpleRecordStore(context, TEST_SPLIT_HOOK);
+            recordStore.markIndexWriteOnly(indexName).join();
+            commit(context);
+        }
+
+        String bigOlString = Strings.repeat("x", SplitHelper.SPLIT_RECORD_SIZE + 2);
+        saveAndSplitSimpleRecord(1, bigOlString, 1);
+        saveAndSplitSimpleRecord(2, bigOlString, 2);
+
+        OnlineIndexer indexer;
+        List<Tuple> boundaryPrimaryKeys;
+        TupleRange range;
+        try (FDBRecordContext context = database.openContext()) {
+            openSimpleRecordStore(context, TEST_SPLIT_HOOK);
+            Index index = recordStore.getRecordMetaData().getIndex(indexName);
+
+            // The indexer only uses recordStore as a prototype so does not require the original record store is still
+            // active.
+            indexer = OnlineIndexer.newBuilder()
+                    .setDatabase(fdb).setRecordStore(recordStore).setIndex(index)
+                    .build();
+
+            range = recordStore.context.asyncToSync(FDBStoreTimer.Waits.WAIT_BUILD_ENDPOINTS,
+                    indexer.buildEndpoints());
+            logger.info("The endpoints are " + range);
+
+            MockedLocalityUtil.init(new ArrayList<>(Arrays.asList(recordStore.recordsSubspace().pack(1), recordStore.recordsSubspace().pack(2))), 0);
+            boundaryPrimaryKeys = recordStore.context.asyncToSync(FDBStoreTimer.Waits.WAIT_GET_BOUNDARY,
+                    recordStore.getPrimaryKeyBoundaries(range.getLow(), range.getHigh()).asList());
+            assertEquals(0, boundaryPrimaryKeys.size());
+            logger.info("The boundary primary keys are " + boundaryPrimaryKeys);
+
+            commit(context);
+        }
+
+        // Test splitIndexBuildRange.
+        assertEquals(1, indexer.splitIndexBuildRange(Integer.MAX_VALUE, Integer.MAX_VALUE).size());
+
+        indexer.close();
+        database.close();
+    }
+
+    private List<Pair<Tuple, Tuple>> getOneRangePerSplit(TupleRange tupleRange, List<Tuple> boundaries) {
+        List<Tuple> newBoundaries = new ArrayList<>(boundaries);
+        if (tupleRange.getLow().compareTo(boundaries.get(0)) < 0) {
+            newBoundaries.add(0, tupleRange.getLow());
+        }
+        if (tupleRange.getHigh().compareTo(boundaries.get(boundaries.size() - 1)) > 0) {
+            newBoundaries.add(tupleRange.getHigh());
+        }
+
+        List<Pair<Tuple, Tuple>> oneRangePerSplit = new ArrayList<>();
+        for (int i = 0; i < newBoundaries.size() - 1; i++) {
+            oneRangePerSplit.add(Pair.of(newBoundaries.get(i), newBoundaries.get(i + 1)));
+        }
+        return oneRangePerSplit;
+    }
+
+    private void checkSplitIndexBuildRange(int minSplit, int maxSplit,
+                                           @Nullable List<Pair<Tuple, Tuple>> expectedSplitRanges,
+                                           OnlineIndexer indexer) {
+        List<Pair<Tuple, Tuple>> splitRanges = indexer.splitIndexBuildRange(minSplit, maxSplit);
+
+        if (expectedSplitRanges != null) {
+            assertEquals(expectedSplitRanges, splitRanges);
+        }
+
+        assertThat(splitRanges.size(), greaterThanOrEqualTo(minSplit));
+        assertThat(splitRanges.size(), lessThanOrEqualTo(maxSplit));
+
+        try (FDBRecordContext context = openContext()) {
+            openSimpleRecordStore(context, TEST_SPLIT_HOOK);
+
+            // Make sure each endpoint is a valid primary key.
+            splitRanges.forEach(range -> {
+                assertTrue(recordStore.recordExists(range.getLeft()));
+                assertTrue(recordStore.recordExists(range.getRight()));
+                recordStore.loadRecord(range.getRight());
+            });
+
+            commit(context);
+        }
+    }
+
+    @Test
+    public void testMockedLocalityUtil() {
+        runLocalityTest(() -> testMockedLocalityUtilImpl());
+    }
+
+    public void testMockedLocalityUtilImpl() {
+        FDBDatabase database = FDBDatabaseFactory.instance().getDatabase();
+
+        try (FDBRecordContext context = database.openContext()) {
+            openSimpleRecordStore(context, TEST_SPLIT_HOOK);
+            ArrayList<byte[]> keys = new ArrayList<>();
+            for (int i = 0; i < 50; i++) {
+                keys.add(recordStore.recordsSubspace().pack(i));
+            }
+            byte[] upperBound = recordStore.recordsSubspace().pack(50);
+
+            testRangeCount(context, keys, upperBound, 0);
+            testRangeCount(context, keys, upperBound, 1);
+            testRangeCount(context, keys, upperBound, new Random().nextInt(keys.size()) + 1);
+            testRangeCount(context, keys, upperBound, keys.size() - 1);
+            testRangeCount(context, keys, upperBound, keys.size());
+            IllegalArgumentException ex = assertThrows(IllegalArgumentException.class, () -> testRangeCount(context, keys, upperBound, keys.size() + 5));
+            assertEquals(ex.getMessage(), "rangeCount must be less than (or equal) the size of keys");
+
+            testRangeCount(context, keys, keys.get(keys.size() - 1), 0);
+            testRangeCount(context, keys, keys.get(keys.size() - 1), 1);
+            testRangeCount(context, keys, keys.get(keys.size() - 1), new Random().nextInt(keys.size()) + 1);
+            testRangeCount(context, keys, keys.get(keys.size() - 1), keys.size() - 1);
+            testRangeCount(context, keys, keys.get(keys.size() - 1), keys.size());
+            commit(context);
+        }
+        database.close();
+    }
+
+    private void testRangeCount(@Nonnull FDBRecordContext context, @Nonnull ArrayList<byte[]> keys, byte[] upperBound, int rangeCount) {
+        MockedLocalityUtil.init(keys, rangeCount);
+        CloseableAsyncIterator<byte[]> cursor = MockedLocalityUtil.instance().getBoundaryKeys(context.ensureActive(), keys.get(0), upperBound);
+        assertTrue(rangeCount == Iterators.size(cursor) || MockedLocalityUtil.getLastRange().equals(upperBound));
+        cursor.close();
+    }
+
+    private void runLocalityTest(Runnable test) {
+        final FDBLocalityProvider origProvider = FDBDatabaseFactory.instance().getLocalityProvider();
+        try {
+            test.run();
+        } finally {
+            FDBDatabaseFactory.instance().setLocalityProvider(origProvider);
+        }
+    }
 }

@@ -74,7 +74,7 @@ public class FDBRestrictedIndexQueryTest extends FDBRecordStoreQueryTestBase {
      * Verify that re-marking the index as readable makes the planner use the index again.
      * TODO: Abstract out common code in queryWithWriteOnly, queryWithDisabled, queryAggregateWithWriteOnly and queryAggregateWithDisabled (https://github.com/FoundationDB/fdb-record-layer/issues/4)
      */
-    @Test
+    @DualPlannerTest
     public void queryWithWriteOnly() throws Exception {
         RecordQuery query = RecordQuery.newBuilder()
                 .setRecordType("MySimpleRecord")
@@ -128,7 +128,7 @@ public class FDBRestrictedIndexQueryTest extends FDBRecordStoreQueryTestBase {
 
             // Override state to read the write-only index.
             RecordQueryPlanner planner = new RecordQueryPlanner(
-                    recordStore.getRecordMetaData(), RecordStoreState.EMPTY, recordStore.getTimer());
+                    recordStore.getRecordMetaData(), new RecordStoreState(null, null), recordStore.getTimer());
             RecordQueryPlan plan = planner.plan(query);
             assertThat(plan, indexScan(allOf(indexName("MySimpleRecord$num_value_3_indexed"),
                     bounds(hasTupleString("[[5],>")))));
@@ -149,7 +149,7 @@ public class FDBRestrictedIndexQueryTest extends FDBRecordStoreQueryTestBase {
      * Verify that re-enabling the index makes the planner use it again.
      * TODO: Abstract out common code in queryWithWriteOnly, queryWithDisabled, queryAggregateWithWriteOnly and queryAggregateWithDisabled (https://github.com/FoundationDB/fdb-record-layer/issues/4)
      */
-    @Test
+    @DualPlannerTest
     public void queryWithDisabled() throws Exception {
         try (FDBRecordContext context = openContext()) {
             openSimpleRecordStore(context);
@@ -358,7 +358,7 @@ public class FDBRestrictedIndexQueryTest extends FDBRecordStoreQueryTestBase {
     /**
      * Verify that queries do not use prohibited indexes.
      */
-    @Test
+    @DualPlannerTest
     public void queryAllowedIndexes() throws Exception {
         RecordMetaDataHook hook = metaData -> {
             metaData.removeIndex("MySimpleRecord$str_value_indexed");
@@ -397,12 +397,11 @@ public class FDBRestrictedIndexQueryTest extends FDBRecordStoreQueryTestBase {
         try (FDBRecordContext context = openContext()) {
             openSimpleRecordStore(context, hook);
             try (RecordCursor<FDBQueriedRecord<Message>> cursor = recordStore.executeQuery(plan1)) {
-                assertTrue(cursor.hasNext());
-                FDBQueriedRecord<Message> rec = cursor.next();
+                FDBQueriedRecord<Message> rec = cursor.getNext().get();
                 TestRecords1Proto.MySimpleRecord.Builder myrec = TestRecords1Proto.MySimpleRecord.newBuilder();
                 myrec.mergeFrom(rec.getRecord());
                 assertEquals("abc", myrec.getStrValueIndexed());
-                assertFalse(cursor.hasNext());
+                assertFalse(cursor.getNext().hasNext());
             }
             TestHelpers.assertDiscardedExactly(1, context);
             clearStoreCounter(context);
@@ -421,12 +420,11 @@ public class FDBRestrictedIndexQueryTest extends FDBRecordStoreQueryTestBase {
         try (FDBRecordContext context = openContext()) {
             openSimpleRecordStore(context, hook);
             try (RecordCursor<FDBQueriedRecord<Message>> cursor = recordStore.executeQuery(plan2)) {
-                assertTrue(cursor.hasNext());
-                FDBQueriedRecord<Message> rec = cursor.next();
+                FDBQueriedRecord<Message> rec = cursor.getNext().get();
                 TestRecords1Proto.MySimpleRecord.Builder myrec = TestRecords1Proto.MySimpleRecord.newBuilder();
                 myrec.mergeFrom(rec.getRecord());
                 assertEquals("abc", myrec.getStrValueIndexed());
-                assertFalse(cursor.hasNext());
+                assertFalse(cursor.getNext().hasNext());
             }
             TestHelpers.assertDiscardedNone(context);
         }
@@ -435,7 +433,7 @@ public class FDBRestrictedIndexQueryTest extends FDBRecordStoreQueryTestBase {
     /**
      * Verify that queries can override prohibited indexes explicitly.
      */
-    @Test
+    @DualPlannerTest
     public void queryAllowedUniversalIndex() throws Exception {
         RecordMetaDataHook hook = metaData -> {
             metaData.addUniversalIndex(

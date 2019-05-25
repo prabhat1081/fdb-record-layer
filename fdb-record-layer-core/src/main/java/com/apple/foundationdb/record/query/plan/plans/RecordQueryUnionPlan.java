@@ -20,7 +20,7 @@
 
 package com.apple.foundationdb.record.query.plan.plans;
 
-import com.apple.foundationdb.API;
+import com.apple.foundationdb.annotation.API;
 import com.apple.foundationdb.record.PlanHashable;
 import com.apple.foundationdb.record.RecordCursor;
 import com.apple.foundationdb.record.metadata.expressions.KeyExpression;
@@ -111,12 +111,12 @@ public class RecordQueryUnionPlan extends RecordQueryUnionPlanBase {
 
     @Override
     public int hashCode() {
-        return Objects.hash(Sets.newHashSet(getChildren()), getComparisonKey(), isReverse()); // isomorphic under re-ordering of children
+        return Objects.hash(Sets.newHashSet(getQueryPlanChildren()), getComparisonKey(), isReverse()); // isomorphic under re-ordering of children
     }
 
     @Override
     public int planHash() {
-        return PlanHashable.planHash(getChildren()) + getComparisonKey().planHash() + (isReverse() ? 1 : 0);
+        return PlanHashable.planHash(getQueryPlanChildren()) + getComparisonKey().planHash() + (isReverse() ? 1 : 0);
     }
 
     @Nonnull

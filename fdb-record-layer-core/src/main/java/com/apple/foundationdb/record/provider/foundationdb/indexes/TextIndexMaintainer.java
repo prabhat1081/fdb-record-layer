@@ -20,7 +20,7 @@
 
 package com.apple.foundationdb.record.provider.foundationdb.indexes;
 
-import com.apple.foundationdb.API;
+import com.apple.foundationdb.annotation.API;
 import com.apple.foundationdb.KeyValue;
 import com.apple.foundationdb.Range;
 import com.apple.foundationdb.async.AsyncUtil;
@@ -37,6 +37,7 @@ import com.apple.foundationdb.record.ScanProperties;
 import com.apple.foundationdb.record.SpotBugsSuppressWarnings;
 import com.apple.foundationdb.record.TupleRange;
 import com.apple.foundationdb.record.logging.KeyValueLogMessage;
+import com.apple.foundationdb.record.logging.LogMessageKeys;
 import com.apple.foundationdb.record.metadata.Index;
 import com.apple.foundationdb.record.metadata.IndexOptions;
 import com.apple.foundationdb.record.metadata.Key;
@@ -76,21 +77,23 @@ import java.util.function.Function;
 
 /**
  * The index maintainer class for full-text indexes. This takes an expression whose first
- * column (not counting grouping columns) is of type <code>string</code>. It will split the
- * text found at that column using a {@link TextTokenizer} and then write separate index keys
+ * column (not counting grouping columns) is of type {@link com.google.protobuf.Descriptors.FieldDescriptor.Type#STRING string}.
+ * It will split the text found at that column using a {@link TextTokenizer} and then write separate index keys
  * for each token found in the text. This then supports queries on the tokenized text, such as:
  *
  * <ul>
- *     <li>All records containing <i>all</i> elements from a set of tokens: <code>Query.field(fieldName).text().containsAll(tokens)</code></li>
- *     <li>All records containing <i>any</i> elements from a set of tokens: <code>Query.field(fieldName).text().containsAny(tokens)</code></li>
- *     <li>All records containing all elements from a set of tokens within some maximum span: Query.field(fieldName).text().containsAll(tokens, span)</li>
- *     <li>All records containing an exact phrase (modulo normalization and stop-word removal done by the tokenizer): <code>Query.field(fieldName).text().containsPhrase(phrase)</code></li>
- *     <li>All records containing at least one token that begins with a given prefix: <code>Query.field(fieldName).text().containsPrefix(prefix)</code></li>
+ *     <li>All records containing <em>all</em> elements from a set of tokens: {@code Query.field(fieldName).text().containsAll(tokens)}</li>
+ *     <li>All records containing <em>any</em> elements from a set of tokens: {@code Query.field(fieldName).text().containsAny(tokens)}</li>
+ *     <li>All records containing all elements from a set of tokens within some maximum span: {@code Query.field(fieldName).text().containsAll(tokens, span)}</li>
+ *     <li>All records containing an exact phrase (modulo normalization and stop-word removal done by the tokenizer): {@code Query.field(fieldName).text().containsPhrase(phrase)}</li>
+ *     <li>All records containing at least one token that begins with a given prefix: {@code Query.field(fieldName).text().containsPrefix(prefix)}</li>
+ *     <li>All records containing at least one token that begins with <em>any</em> of a set of prefixes: {@code Query.field(fieldName).text().containsAnyPrefix(prefixes)}</li>
+ *     <li>All records containing at least one token that begins with <em>each</em> of a set of prefixes: {@code Query.field(fieldName).text().containsAllPrefixes(prefixes)}</li>
  * </ul>
  *
  * <p>
- * One can specify a tokenizer to use by setting the "{@value IndexOptions#TEXT_TOKENIZER_NAME_OPTION}" and
- * "{@value IndexOptions#TEXT_TOKENIZER_VERSION_OPTION}" options on the index. If no tokenizer is given,
+ * One can specify a tokenizer to use by setting the {@value IndexOptions#TEXT_TOKENIZER_NAME_OPTION} and
+ * {@value IndexOptions#TEXT_TOKENIZER_VERSION_OPTION} options on the index. If no tokenizer is given,
  * it will use a {@link com.apple.foundationdb.record.provider.common.text.DefaultTextTokenizer DefaultTextTokenizer},
  * and if no version is specified, it will assume version {@value TextTokenizer#GLOBAL_MIN_VERSION}.
  * There should be one {@link TextTokenizer} implementation that uses that name and one
@@ -112,8 +115,8 @@ import java.util.function.Function;
  * between records that arrive simultaneously, though it should be noted that the underlying data structure of the
  * text index means that it is already likely that two records that happen to share common tokens that are updated
  * simultaneously will conflict, so it might not actually produce more conflicts in practice. To enable adding
- * conflict ranges over larger areas, set the "{@value IndexOptions#TEXT_ADD_AGGRESSIVE_CONFLICT_RANGES_OPTION}" option
- * to "true". <b>Warning:</b> This feature is currently experimental, and may change at any moment without prior notice.
+ * conflict ranges over larger areas, set the {@value IndexOptions#TEXT_ADD_AGGRESSIVE_CONFLICT_RANGES_OPTION} option
+ * to {@code true}. <b>Warning:</b> This feature is currently experimental, and may change at any moment without prior notice.
  * <!-- TODO: Remove the above disclaimer if/when we are happy with this feature staying in.-->
  * </p>
  *
@@ -290,23 +293,23 @@ public class TextIndexMaintainer extends StandardIndexMaintainer {
         final FDBStoreTimer.Event indexUpdateEvent = remove ? FDBStoreTimer.Events.DELETE_INDEX_ENTRY : FDBStoreTimer.Events.SAVE_INDEX_ENTRY;
         if (LOGGER.isDebugEnabled()) {
             KeyValueLogMessage msg = KeyValueLogMessage.build("performed text tokenization",
-                    "remove", remove,
-                    "textSize", text.length(),
-                    "uniqueTokens", positionMap.size(),
-                    "avgTokenSize", positionMap.keySet().stream().mapToInt(String::length).sum() * 1.0 / positionMap.size(),
-                    "maxTokenSize", positionMap.keySet().stream().mapToInt(String::length).max().orElse(0),
-                    "avgPositions", positionMap.values().stream().mapToInt(List::size).sum() * 1.0 / positionMap.size(),
-                    "maxPositions", positionMap.values().stream().mapToInt(List::size).max().orElse(0),
-                    "textKeySize", estimatedSize.getKey(),
-                    "textValueSize", estimatedSize.getValue(),
-                    "textIndexSizeAmortized", estimatedSize.getKey() / 10 + estimatedSize.getValue(),
-                    IndexOptions.TEXT_TOKENIZER_NAME_OPTION, tokenizer.getName(),
-                    IndexOptions.TEXT_TOKENIZER_VERSION_OPTION, recordTokenizerVersion,
-                    IndexOptions.TEXT_ADD_AGGRESSIVE_CONFLICT_RANGES_OPTION, addAggressiveConflictRanges,
-                    "primaryKey", savedRecord.getPrimaryKey(),
-                    "subspace", ByteArrayUtil2.loggable(state.store.getSubspace().getKey()),
-                    "indexSubspace", ByteArrayUtil2.loggable(state.indexSubspace.getKey()),
-                    "wroteIndex", true);
+                                        LogMessageKeys.REMOVE, remove,
+                                        LogMessageKeys.TEXT_SIZE, text.length(),
+                                        LogMessageKeys.UNIQUE_TOKENS, positionMap.size(),
+                                        LogMessageKeys.AVG_TOKEN_SIZE, positionMap.keySet().stream().mapToInt(String::length).sum() * 1.0 / positionMap.size(),
+                                        LogMessageKeys.MAX_TOKEN_SIZE, positionMap.keySet().stream().mapToInt(String::length).max().orElse(0),
+                                        LogMessageKeys.AVG_POSITIONS, positionMap.values().stream().mapToInt(List::size).sum() * 1.0 / positionMap.size(),
+                                        LogMessageKeys.MAX_POSITIONS, positionMap.values().stream().mapToInt(List::size).max().orElse(0),
+                                        LogMessageKeys.TEXT_KEY_SIZE, estimatedSize.getKey(),
+                                        LogMessageKeys.TEXT_VALUE_SIZE, estimatedSize.getValue(),
+                                        LogMessageKeys.TEXT_INDEX_SIZE_AMORTIZED, estimatedSize.getKey() / 10 + estimatedSize.getValue(),
+                                        IndexOptions.TEXT_TOKENIZER_NAME_OPTION, tokenizer.getName(),
+                                        IndexOptions.TEXT_TOKENIZER_VERSION_OPTION, recordTokenizerVersion,
+                                        IndexOptions.TEXT_ADD_AGGRESSIVE_CONFLICT_RANGES_OPTION, addAggressiveConflictRanges,
+                                        LogMessageKeys.PRIMARY_KEY, savedRecord.getPrimaryKey(),
+                                        LogMessageKeys.SUBSPACE, ByteArrayUtil2.loggable(state.store.getSubspace().getKey()),
+                                        LogMessageKeys.INDEX_SUBSPACE, ByteArrayUtil2.loggable(state.indexSubspace.getKey()),
+                                        LogMessageKeys.WROTE_INDEX, true);
             LOGGER.debug(msg.toString());
         }
         if (positionMap.isEmpty()) {
@@ -548,7 +551,7 @@ public class TextIndexMaintainer extends StandardIndexMaintainer {
                 callback,
                 scanProperties.isReverse()
         );
-        RecordCursor<IndexEntry> cursor = new TextCursor(iterator, state.store.getExecutor(), state.context, withAdjustedLimit);
+        RecordCursor<IndexEntry> cursor = new TextCursor(iterator, state.store.getExecutor(), state.context, withAdjustedLimit, state.index);
         if (scanProperties.getExecuteProperties().getSkip() != 0) {
             cursor = cursor.skip(scanProperties.getExecuteProperties().getSkip());
         }

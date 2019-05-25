@@ -20,7 +20,7 @@
 
 package com.apple.foundationdb.record.query.expressions;
 
-import com.apple.foundationdb.API;
+import com.apple.foundationdb.annotation.API;
 import com.apple.foundationdb.record.PlanHashable;
 import com.apple.foundationdb.record.query.plan.temp.ExpressionRef;
 import com.apple.foundationdb.record.query.plan.temp.SingleExpressionRef;
@@ -47,7 +47,7 @@ public class AndComponent extends AndOrComponent {
         super(operands);
     }
 
-    public static AndComponent from(@Nonnull List<QueryComponent> operands) {
+    public static AndComponent from(@Nonnull List<? extends QueryComponent> operands) {
         ImmutableList.Builder<ExpressionRef<QueryComponent>> operandRefs = ImmutableList.builder();
         for (QueryComponent operand : operands) {
             operandRefs.add(SingleExpressionRef.of(operand));

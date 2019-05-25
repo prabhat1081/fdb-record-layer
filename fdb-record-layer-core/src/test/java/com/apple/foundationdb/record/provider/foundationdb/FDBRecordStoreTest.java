@@ -31,14 +31,16 @@ import com.apple.foundationdb.record.IsolationLevel;
 import com.apple.foundationdb.record.RecordCoreException;
 import com.apple.foundationdb.record.RecordCoreStorageException;
 import com.apple.foundationdb.record.RecordCursor;
+import com.apple.foundationdb.record.RecordCursorIterator;
 import com.apple.foundationdb.record.RecordIndexUniquenessViolation;
 import com.apple.foundationdb.record.RecordMetaData;
 import com.apple.foundationdb.record.RecordMetaDataBuilder;
 import com.apple.foundationdb.record.RecordMetaDataOptionsProto;
 import com.apple.foundationdb.record.RecordMetaDataProvider;
-import com.apple.foundationdb.record.RecordStoreState;
 import com.apple.foundationdb.record.ScanProperties;
 import com.apple.foundationdb.record.TestHelpers;
+import com.apple.foundationdb.record.TestNoIndexesProto;
+import com.apple.foundationdb.record.TestNoUnionProto;
 import com.apple.foundationdb.record.TestRecords1EvolvedAgainProto;
 import com.apple.foundationdb.record.TestRecords1EvolvedProto;
 import com.apple.foundationdb.record.TestRecords1Proto;
@@ -49,6 +51,7 @@ import com.apple.foundationdb.record.TestRecordsImportProto;
 import com.apple.foundationdb.record.TestRecordsWithHeaderProto;
 import com.apple.foundationdb.record.TestRecordsWithUnionProto;
 import com.apple.foundationdb.record.TupleRange;
+import com.apple.foundationdb.record.logging.LogMessageKeys;
 import com.apple.foundationdb.record.metadata.Index;
 import com.apple.foundationdb.record.metadata.IndexTypes;
 import com.apple.foundationdb.record.metadata.Key;
@@ -66,10 +69,14 @@ import com.apple.foundationdb.tuple.Tuple;
 import com.apple.test.Tags;
 import com.google.common.base.Strings;
 import com.google.protobuf.ByteString;
+import com.google.protobuf.DescriptorProtos;
 import com.google.protobuf.Descriptors;
+import com.google.protobuf.DynamicMessage;
 import com.google.protobuf.Message;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -99,6 +106,7 @@ import static org.hamcrest.Matchers.allOf;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.greaterThan;
+import static org.hamcrest.Matchers.greaterThanOrEqualTo;
 import static org.hamcrest.Matchers.instanceOf;
 import static org.hamcrest.Matchers.lessThan;
 import static org.hamcrest.Matchers.startsWith;
@@ -107,9 +115,11 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
  * Basic tests for {@link FDBRecordStore}.
@@ -335,6 +345,150 @@ public class FDBRecordStoreTest extends FDBRecordStoreTestBase {
     }
 
     @Test
+    public void readPreloaded() throws Exception {
+        byte[] versionstamp;
+        try (FDBRecordContext context = openContext()) {
+            openSimpleRecordStore(context);
+
+            TestRecords1Proto.MySimpleRecord rec = TestRecords1Proto.MySimpleRecord.newBuilder()
+                    .setRecNo(1066L)
+                    .build();
+            recordStore.saveRecord(rec);
+
+            commit(context);
+            versionstamp = context.getVersionStamp();
+            assertNotNull(versionstamp);
+        }
+
+        try (FDBRecordContext context = openContext()) {
+            openSimpleRecordStore(context);
+            recordStore.preloadRecordAsync(Tuple.from(1066L)).get();  // ensure loaded in context
+            context.ensureActive().cancel(); // ensure no more I/O done through the transaction
+            FDBStoredRecord<Message> record = recordStore.loadRecord(Tuple.from(1066L));
+            assertNotNull(record);
+            assertSame(TestRecords1Proto.MySimpleRecord.getDescriptor(), record.getRecordType().getDescriptor());
+            assertEquals(1066L, record.getRecord().getField(TestRecords1Proto.MySimpleRecord.getDescriptor().findFieldByNumber(TestRecords1Proto.MySimpleRecord.REC_NO_FIELD_NUMBER)));
+            assertEquals(FDBRecordVersion.complete(versionstamp, 0), record.getVersion());
+
+            FDBExceptions.FDBStoreException e = assertThrows(FDBExceptions.FDBStoreException.class, context::commit);
+            assertNotNull(e.getCause());
+            assertThat(e.getCause(), instanceOf(FDBException.class));
+            FDBException fdbE = (FDBException)e.getCause();
+            assertEquals(1025, fdbE.getCode());  // transaction_cancelled
+        }
+    }
+
+    @Test
+    public void readYourWritesPreloaded() throws Exception {
+        try (FDBRecordContext context = openContext()) {
+            openSimpleRecordStore(context);
+
+            TestRecords1Proto.MySimpleRecord rec = TestRecords1Proto.MySimpleRecord.newBuilder()
+                    .setRecNo(1066L)
+                    .build();
+            recordStore.saveRecord(rec);
+
+            recordStore.preloadRecordAsync(Tuple.from(1066L)).get();
+            context.ensureActive().cancel(); // ensure no more I/O done through the transaction
+            FDBStoredRecord<Message> record = recordStore.loadRecord(Tuple.from(1066L));
+            assertNotNull(record);
+            assertSame(TestRecords1Proto.MySimpleRecord.getDescriptor(), record.getRecordType().getDescriptor());
+            assertEquals(rec.toByteString(), record.getRecord().toByteString());
+            assertEquals(FDBRecordVersion.incomplete(0), record.getVersion());
+
+            FDBExceptions.FDBStoreException e = assertThrows(FDBExceptions.FDBStoreException.class, context::commit);
+            assertNotNull(e.getCause());
+            assertThat(e.getCause(), instanceOf(FDBException.class));
+            FDBException fdbE = (FDBException)e.getCause();
+            assertEquals(1025, fdbE.getCode());  // transaction_cancelled
+        }
+    }
+
+    @Test
+    public void deletePreloaded() throws Exception {
+        try (FDBRecordContext context = openContext()) {
+            openSimpleRecordStore(context);
+
+            TestRecords1Proto.MySimpleRecord rec = TestRecords1Proto.MySimpleRecord.newBuilder()
+                    .setRecNo(1066L)
+                    .build();
+            recordStore.saveRecord(rec);
+
+            commit(context);
+        }
+        try (FDBRecordContext context = openContext()) {
+            openSimpleRecordStore(context);
+            recordStore.preloadRecordAsync(Tuple.from(1066L)).get();  // ensure loaded in context
+            recordStore.deleteRecord(Tuple.from(1066L));
+            FDBStoredRecord<Message> record = recordStore.loadRecord(Tuple.from(1066L));
+            assertNull(record);
+        }
+    }
+
+    @Test
+    public void deleteAllPreloaded() throws Exception {
+        try (FDBRecordContext context = openContext()) {
+            openSimpleRecordStore(context);
+
+            TestRecords1Proto.MySimpleRecord rec = TestRecords1Proto.MySimpleRecord.newBuilder()
+                    .setRecNo(1066L)
+                    .build();
+            recordStore.saveRecord(rec);
+
+            commit(context);
+        }
+        try (FDBRecordContext context = openContext()) {
+            openSimpleRecordStore(context);
+            recordStore.preloadRecordAsync(Tuple.from(1066L)).get();  // ensure loaded in context
+            recordStore.deleteAllRecords();
+            FDBStoredRecord<Message> record = recordStore.loadRecord(Tuple.from(1066L));
+            assertNull(record);
+        }
+    }
+
+    @Test
+    public void saveOverPreloaded() throws Exception {
+        try (FDBRecordContext context = openContext()) {
+            openSimpleRecordStore(context);
+
+            TestRecords1Proto.MySimpleRecord rec = TestRecords1Proto.MySimpleRecord.newBuilder()
+                    .setRecNo(1066L)
+                    .setStrValueIndexed("first_value")
+                    .build();
+            recordStore.saveRecord(rec);
+
+            commit(context);
+        }
+        try (FDBRecordContext context = openContext()) {
+            openSimpleRecordStore(context);
+            recordStore.preloadRecordAsync(Tuple.from(1066L)).get();  // ensure loaded in context
+
+            TestRecords1Proto.MySimpleRecord rec = TestRecords1Proto.MySimpleRecord.newBuilder()
+                    .setRecNo(1066L)
+                    .setStrValueIndexed("second_value")
+                    .build();
+            recordStore.saveRecord(rec);
+
+            FDBStoredRecord<Message> record = recordStore.loadRecord(Tuple.from(1066L));
+            assertNotNull(record);
+            assertSame(TestRecords1Proto.MySimpleRecord.getDescriptor(), record.getRecordType().getDescriptor());
+            assertEquals(1066L, record.getRecord().getField(TestRecords1Proto.MySimpleRecord.getDescriptor().findFieldByNumber(TestRecords1Proto.MySimpleRecord.REC_NO_FIELD_NUMBER)));
+            assertEquals("second_value", record.getRecord().getField(TestRecords1Proto.MySimpleRecord.getDescriptor().findFieldByNumber(TestRecords1Proto.MySimpleRecord.STR_VALUE_INDEXED_FIELD_NUMBER)));
+            assertEquals(FDBRecordVersion.incomplete(0), record.getVersion());
+        }
+    }
+
+    @Test
+    public void preloadNonExisting() throws Exception {
+        try (FDBRecordContext context = openContext()) {
+            openSimpleRecordStore(context);
+
+            // Make sure pre-loading a non-existing record doesn't fail
+            recordStore.preloadRecordAsync(Tuple.from(1L, 2L, 3L, 4L));
+        }
+    }
+
+    @Test
     public void longRecords() throws Exception {
         Random rand = new Random();
         byte[] bytes;
@@ -389,7 +543,7 @@ public class FDBRecordStoreTest extends FDBRecordStoreTestBase {
         }
         try (FDBRecordContext context = openContext()) {
             openLongRecordStore(context);
-            RecordCursor<FDBStoredRecord<Message>> cursor = recordStore.scanRecords(null, ScanProperties.FORWARD_SCAN);
+            RecordCursorIterator<FDBStoredRecord<Message>> cursor = recordStore.scanRecords(null, ScanProperties.FORWARD_SCAN).asIterator();
             assertTrue(cursor.hasNext());
             FDBStoredRecord<Message> rec1 = cursor.next();
             TestRecords2Proto.MyLongRecord.Builder myrec1 = TestRecords2Proto.MyLongRecord.newBuilder();
@@ -428,7 +582,7 @@ public class FDBRecordStoreTest extends FDBRecordStoreTestBase {
                     int i = 0;
                     byte[] continuation = null;
                     do {
-                        try (RecordCursor<FDBStoredRecord<Message>> cursor = scanContinuationsCursor(continuation, limit, false, builtInLimit)) {
+                        try (RecordCursorIterator<FDBStoredRecord<Message>> cursor = scanContinuationsCursor(continuation, limit, false, builtInLimit).asIterator()) {
                             while (cursor.hasNext()) {
                                 assertEquals(i, cursor.next().getPrimaryKey().getLong(0));
                                 i++;
@@ -438,7 +592,7 @@ public class FDBRecordStoreTest extends FDBRecordStoreTestBase {
                     } while (continuation != null);
                     assertEquals(100, i);
                     do {
-                        try (RecordCursor<FDBStoredRecord<Message>> cursor = scanContinuationsCursor(continuation, limit, true, builtInLimit)) {
+                        try (RecordCursorIterator<FDBStoredRecord<Message>> cursor = scanContinuationsCursor(continuation, limit, true, builtInLimit).asIterator()) {
                             while (cursor.hasNext()) {
                                 i--;
                                 assertEquals(i, cursor.next().getPrimaryKey().getLong(0));
@@ -774,9 +928,7 @@ public class FDBRecordStoreTest extends FDBRecordStoreTestBase {
             TupleRange range = comparisons.toTupleRange();
             try (RecordCursor<IndexEntry> cursor = recordStore.scanIndex(index, IndexScanType.BY_VALUE, range,
                                                                             null, ScanProperties.FORWARD_SCAN)) {
-                while (cursor.hasNext()) {
-                    rows.add(cursor.next().getKey().getItems());
-                }
+                cursor.forEach(row -> rows.add(row.getKey().getItems())).join();
             }
             assertEquals(Arrays.asList(Arrays.asList("aaa", "goodbye", 2L),
                                        Arrays.asList("aaa", "hello", 1L)),
@@ -929,18 +1081,19 @@ public class FDBRecordStoreTest extends FDBRecordStoreTestBase {
         try (FDBRecordContext context = openContext()) {
             openSimpleRecordStore(context, TEST_SPLIT_HOOK);
 
-            RecordCursor<FDBStoredRecord<Message>> messageCursor = recordStore.scanRecords(null,
+            RecordCursorIterator<FDBStoredRecord<Message>> messageCursor = recordStore.scanRecords(null,
                     new ScanProperties(ExecuteProperties.newBuilder()
                             .setReturnedRowLimit(1)
                             .setIsolationLevel(IsolationLevel.SERIALIZABLE)
-                            .build()));
+                            .build()))
+                    .asIterator();
             while (messageCursor.hasNext()) {
                 scannedRecords.add(messageCursor.next());
                 messageCursor = recordStore.scanRecords(messageCursor.getContinuation(), new ScanProperties(
                         ExecuteProperties.newBuilder()
                                 .setReturnedRowLimit(1)
                                 .setIsolationLevel(IsolationLevel.SERIALIZABLE)
-                        .build()));
+                        .build())).asIterator();
             }
             commit(context);
         }
@@ -1712,7 +1865,7 @@ public class FDBRecordStoreTest extends FDBRecordStoreTestBase {
                     .setMetaDataProvider(metaDataBuilder).createOrOpen();
             assertEquals(expectedSubspace, recordStore.getSubspace());
             assertEquals(recordStore.getRecordStoreState(), recordStore.getRecordStoreState());
-            assertEquals(RecordStoreState.EMPTY, recordStore.getRecordStoreState());
+            assertTrue(recordStore.getRecordStoreState().allIndexesReadable());
             assertEquals(metaDataBuilder.getVersion(), recordStore.getRecordMetaData().getVersion());
             final int version = metaDataBuilder.getVersion();
 
@@ -1720,7 +1873,7 @@ public class FDBRecordStoreTest extends FDBRecordStoreTestBase {
             recordStore = recordStore.asBuilder().setMetaDataProvider(metaDataBuilder).open();
             assertEquals(expectedSubspace, recordStore.getSubspace());
             assertEquals(recordStore.getRecordStoreState(), recordStore.getRecordStoreState());
-            assertEquals(RecordStoreState.EMPTY, recordStore.getRecordStoreState());
+            assertTrue(recordStore.getRecordStoreState().allIndexesReadable());
             assertEquals(version + 1, recordStore.getRecordMetaData().getVersion());
 
             recordStore.saveRecord(record); // This stops the index build.
@@ -1730,13 +1883,13 @@ public class FDBRecordStoreTest extends FDBRecordStoreTestBase {
             recordStore = recordStore.asBuilder().setMetaDataProvider(metaDataBuilder).open();
             assertEquals(expectedSubspace, recordStore.getSubspace());
             assertEquals(recordStore.getRecordStoreState(), recordStore.getRecordStoreState());
-            assertEquals(new RecordStoreState(Collections.singletonMap(newIndex2.getName(), IndexState.WRITE_ONLY)), recordStore.getRecordStoreState());
+            assertEquals(Collections.singleton(newIndex2.getName()), recordStore.getRecordStoreState().getWriteOnlyIndexNames());
             assertEquals(version + 2, recordStore.getRecordMetaData().getVersion());
 
             final FDBRecordStore.Builder staleBuilder = recordStore.asBuilder().setMetaDataProvider(staleMetaData);
             TestHelpers.assertThrows(RecordStoreStaleMetaDataVersionException.class, staleBuilder::createOrOpen,
-                    "localVersion", version + 1,
-                    "storedVersion", version + 2);
+                    LogMessageKeys.LOCAL_VERSION.toString(), version + 1,
+                    LogMessageKeys.STORED_VERSION.toString(), version + 2);
         }
 
         // Test open with a MetaDataStore
@@ -1764,7 +1917,7 @@ public class FDBRecordStoreTest extends FDBRecordStoreTestBase {
                     .createOrOpen();
             assertEquals(expectedSubspace, recordStore.getSubspace());
             assertEquals(recordStore.getRecordStoreState(), recordStore.getRecordStoreState());
-            assertEquals(RecordStoreState.EMPTY, recordStore.getRecordStoreState());
+            assertTrue(recordStore.getRecordStoreState().allIndexesReadable());
             assertEquals(version, recordStore.getRecordMetaData().getVersion());
 
             metaDataBuilder.addIndex("MySimpleRecord", newIndex);
@@ -1776,7 +1929,7 @@ public class FDBRecordStoreTest extends FDBRecordStoreTestBase {
                     .open();
             assertEquals(expectedSubspace, recordStore.getSubspace());
             assertEquals(recordStore.getRecordStoreState(), recordStore.getRecordStoreState());
-            assertEquals(RecordStoreState.EMPTY, recordStore.getRecordStoreState());
+            assertTrue(recordStore.getRecordStoreState().allIndexesReadable());
             assertEquals(version + 1, recordStore.getRecordMetaData().getVersion());
             recordStore.saveRecord(record);
 
@@ -1788,15 +1941,15 @@ public class FDBRecordStoreTest extends FDBRecordStoreTestBase {
             recordStore = FDBRecordStore.newBuilder().setContext(context).setSubspace(expectedSubspace).setMetaDataStore(metaDataStore).open();
             assertEquals(expectedSubspace, recordStore.getSubspace());
             assertEquals(recordStore.getRecordStoreState(), recordStore.getRecordStoreState());
-            assertEquals(new RecordStoreState(Collections.singletonMap(newIndex2.getName(), IndexState.WRITE_ONLY)), recordStore.getRecordStoreState());
+            assertEquals(Collections.singleton(newIndex2.getName()), recordStore.getRecordStoreState().getWriteOnlyIndexNames());
             assertEquals(version + 2, recordStore.getRecordMetaData().getVersion());
 
             // The stale meta-data store uses the cached meta-data, hence the stale version exception
             FDBRecordStore.Builder storeBuilder = FDBRecordStore.newBuilder().setContext(context).setSubspace(expectedSubspace)
                     .setMetaDataStore(staleMetaDataStore);
             TestHelpers.assertThrows(RecordStoreStaleMetaDataVersionException.class, storeBuilder::createOrOpen,
-                    "localVersion", version + 1,
-                    "storedVersion", version + 2);
+                    LogMessageKeys.LOCAL_VERSION.toString(), version + 1,
+                    LogMessageKeys.STORED_VERSION.toString(), version + 2);
         }
 
         // Test uncheckedOpen without a MetaDataStore
@@ -1807,14 +1960,14 @@ public class FDBRecordStoreTest extends FDBRecordStoreTestBase {
             FDBRecordStore recordStore = FDBRecordStore.newBuilder().setContext(context).setKeySpacePath(path)
                     .setMetaDataProvider(metaDataBuilder).uncheckedOpen();
             assertEquals(expectedSubspace, recordStore.getSubspace());
-            assertEquals(RecordStoreState.EMPTY, recordStore.getRecordStoreState());
+            assertTrue(recordStore.getRecordStoreState().allIndexesReadable());
             assertEquals(metaDataBuilder.getVersion(), recordStore.getRecordMetaData().getVersion());
             final int version = metaDataBuilder.getVersion();
 
             metaDataBuilder.addIndex("MySimpleRecord", newIndex);
             recordStore = recordStore.asBuilder().setMetaDataProvider(metaDataBuilder).uncheckedOpen();
             assertEquals(expectedSubspace, recordStore.getSubspace());
-            assertEquals(RecordStoreState.EMPTY, recordStore.getRecordStoreState());
+            assertTrue(recordStore.getRecordStoreState().allIndexesReadable());
             assertEquals(version + 1, recordStore.getRecordMetaData().getVersion());
 
             recordStore.saveRecord(record); // This would stop the build if this ran checkVersion.
@@ -1824,12 +1977,12 @@ public class FDBRecordStoreTest extends FDBRecordStoreTestBase {
             recordStore = FDBRecordStore.newBuilder().setContext(context).setKeySpacePath(path)
                     .setMetaDataProvider(metaDataBuilder).uncheckedOpen();
             assertEquals(expectedSubspace, recordStore.getSubspace());
-            assertEquals(RecordStoreState.EMPTY, recordStore.getRecordStoreState());
+            assertTrue(recordStore.getRecordStoreState().allIndexesReadable());
             assertEquals(version + 2, recordStore.getRecordMetaData().getVersion());
 
             recordStore = recordStore.asBuilder().setMetaDataProvider(staleMetaData).uncheckedOpen();
             assertEquals(expectedSubspace, recordStore.getSubspace());
-            assertEquals(RecordStoreState.EMPTY, recordStore.getRecordStoreState());
+            assertTrue(recordStore.getRecordStoreState().allIndexesReadable());
             assertEquals(version + 1, recordStore.getRecordMetaData().getVersion());
         }
 
@@ -1857,7 +2010,7 @@ public class FDBRecordStoreTest extends FDBRecordStoreTestBase {
                     .setMetaDataStore(metaDataStore).setMetaDataProvider(origMetaData)
                     .uncheckedOpen();
             assertEquals(expectedSubspace, recordStore.getSubspace());
-            assertEquals(RecordStoreState.EMPTY, recordStore.getRecordStoreState());
+            assertTrue(recordStore.getRecordStoreState().allIndexesReadable());
             assertEquals(version, recordStore.getRecordMetaData().getVersion());
 
             metaDataBuilder.addIndex("MySimpleRecord", newIndex);
@@ -1868,7 +2021,7 @@ public class FDBRecordStoreTest extends FDBRecordStoreTestBase {
                     .setMetaDataStore(metaDataStore).setMetaDataProvider(origMetaData)
                     .uncheckedOpen();
             assertEquals(expectedSubspace, recordStore.getSubspace());
-            assertEquals(RecordStoreState.EMPTY, recordStore.getRecordStoreState());
+            assertTrue(recordStore.getRecordStoreState().allIndexesReadable());
             assertEquals(version + 1, recordStore.getRecordMetaData().getVersion());
 
             recordStore.saveRecord(record); // This would stop the build if this used checkVersion
@@ -1880,15 +2033,78 @@ public class FDBRecordStoreTest extends FDBRecordStoreTestBase {
             metaDataStore.saveAndSetCurrent(metaDataBuilder.getRecordMetaData().toProto()).join();
             recordStore = FDBRecordStore.newBuilder().setContext(context).setKeySpacePath(path).setMetaDataStore(metaDataStore).uncheckedOpen();
             assertEquals(expectedSubspace, recordStore.getSubspace());
-            assertEquals(RecordStoreState.EMPTY, recordStore.getRecordStoreState());
+            assertTrue(recordStore.getRecordStoreState().allIndexesReadable());
             assertEquals(version + 2, recordStore.getRecordMetaData().getVersion());
 
             // The stale meta-data store uses the cached meta-data, hence the old version in the final assert
             recordStore = FDBRecordStore.newBuilder().setContext(context).setSubspace(expectedSubspace)
                     .setMetaDataStore(staleMetaDataStore).uncheckedOpen();
             assertEquals(expectedSubspace, recordStore.getSubspace());
-            assertEquals(RecordStoreState.EMPTY, recordStore.getRecordStoreState());
+            assertTrue(recordStore.getRecordStoreState().allIndexesReadable());
             assertEquals(version + 1, recordStore.getRecordMetaData().getVersion());
+        }
+    }
+
+    /**
+     * Validate that if the store header changes then an open record store in another transaction is failed with
+     * a conflict.
+     */
+    @Test
+    public void conflictWithHeaderChange() throws Exception {
+        RecordMetaData metaData1 = RecordMetaData.build(TestRecords1Proto.getDescriptor());
+        RecordMetaDataBuilder metaDataBuilder = RecordMetaData.newBuilder().setRecords(TestRecords1Proto.getDescriptor());
+        metaDataBuilder.addIndex("MySimpleRecord", "num_value_2");
+        RecordMetaData metaData2 = metaDataBuilder.getRecordMetaData();
+        assertThat(metaData1.getVersion(), lessThan(metaData2.getVersion()));
+
+        try (FDBRecordContext context = openContext()) {
+            FDBRecordStore recordStore = FDBRecordStore.newBuilder()
+                    .setKeySpacePath(path)
+                    .setContext(context)
+                    .setMetaDataProvider(metaData1)
+                    .create();
+            assertEquals(metaData1.getVersion(), recordStore.getRecordStoreState().getStoreHeader().getMetaDataversion());
+            commit(context);
+        }
+
+        try (FDBRecordContext context1 = openContext(); FDBRecordContext context2 = openContext()) {
+            FDBRecordStore recordStore1 = FDBRecordStore.newBuilder()
+                    .setKeySpacePath(path)
+                    .setContext(context1)
+                    .setMetaDataProvider(metaData1)
+                    .open();
+            assertEquals(metaData1.getVersion(), recordStore1.getRecordStoreState().getStoreHeader().getMetaDataversion());
+
+            FDBRecordStore recordStore2 = FDBRecordStore.newBuilder()
+                    .setKeySpacePath(path)
+                    .setContext(context2)
+                    .setMetaDataProvider(metaData2)
+                    .open();
+            assertEquals(metaData2.getVersion(), recordStore2.getRecordStoreState().getStoreHeader().getMetaDataversion());
+            commit(context2);
+
+            // Add a write to the first record store to make sure that the conflict are actually checked.
+            recordStore1.saveRecord(TestRecords1Proto.MySimpleRecord.newBuilder()
+                    .setRecNo(1066L)
+                    .setNumValue2(1415)
+                    .build());
+            assertThrows(FDBExceptions.FDBStoreTransactionConflictException.class, context1::commit);
+        }
+
+        try (FDBRecordContext context = openContext()) {
+            assertThrows(RecordStoreStaleMetaDataVersionException.class, () -> FDBRecordStore.newBuilder()
+                    .setKeySpacePath(path)
+                    .setContext(context)
+                    .setMetaDataProvider(metaData1)
+                    .open());
+
+            FDBRecordStore recordStore = FDBRecordStore.newBuilder()
+                    .setKeySpacePath(path)
+                    .setContext(context)
+                    .setMetaDataProvider(metaData2)
+                    .open();
+            assertEquals(metaData2.getVersion(), recordStore.getRecordStoreState().getStoreHeader().getMetaDataversion());
+            commit(context);
         }
     }
 
@@ -2162,6 +2378,7 @@ public class FDBRecordStoreTest extends FDBRecordStoreTestBase {
                     .create();
             assertEquals(101, recordStore.getUserVersion());
             assertEquals(metaData1, recordStore.getRecordMetaData());
+            assertEquals(metaData1.getVersion(), recordStore.getRecordStoreState().getStoreHeader().getMetaDataversion());
             context.commit();
         }
         try (FDBRecordContext context = openContext()) {
@@ -2170,6 +2387,7 @@ public class FDBRecordStoreTest extends FDBRecordStoreTestBase {
                     .open();
             assertEquals(101, recordStore.getUserVersion());
             assertEquals(metaData1, recordStore.getRecordMetaData());
+            assertEquals(metaData1.getVersion(), recordStore.getRecordStoreState().getStoreHeader().getMetaDataversion());
             context.commit();
         }
 
@@ -2181,6 +2399,7 @@ public class FDBRecordStoreTest extends FDBRecordStoreTestBase {
                     .create();
             assertEquals(102, recordStore.getUserVersion());
             assertEquals(metaData2, recordStore.getRecordMetaData());
+            assertEquals(metaData2.getVersion(), recordStore.getRecordStoreState().getStoreHeader().getMetaDataversion());
             context.commit();
         }
     }
@@ -2368,12 +2587,12 @@ public class FDBRecordStoreTest extends FDBRecordStoreTestBase {
             assertEquals(rec1, storedRec1.getRecord());
 
             // Scan should return only that record
-            RecordCursor<FDBStoredRecord<Message>> cursor = recordStore.scanRecords(null, ScanProperties.FORWARD_SCAN);
+            RecordCursorIterator<FDBStoredRecord<Message>> cursor = recordStore.scanRecords(null, ScanProperties.FORWARD_SCAN).asIterator();
             assertTrue(cursor.hasNext());
             FDBStoredRecord<Message> scannedRec1 = cursor.next();
             assertEquals(storedRec1, scannedRec1);
             assertFalse(cursor.hasNext());
-            cursor = recordStore.scanRecords(null, ScanProperties.REVERSE_SCAN);
+            cursor = recordStore.scanRecords(null, ScanProperties.REVERSE_SCAN).asIterator();
             assertTrue(cursor.hasNext());
             FDBStoredRecord<Message> scannedReverseRec1 = cursor.next();
             assertEquals(storedRec1, scannedReverseRec1);
@@ -2393,7 +2612,7 @@ public class FDBRecordStoreTest extends FDBRecordStoreTestBase {
             assertEquals(rec2, storedRec2.getRecord());
 
             // Scan should now contain both records.
-            cursor = recordStore.scanRecords(null, ScanProperties.FORWARD_SCAN);
+            cursor = recordStore.scanRecords(null, ScanProperties.FORWARD_SCAN).asIterator();
             assertTrue(cursor.hasNext());
             scannedRec1 = cursor.next();
             assertEquals(storedRec1, scannedRec1);
@@ -2401,7 +2620,7 @@ public class FDBRecordStoreTest extends FDBRecordStoreTestBase {
             FDBStoredRecord<Message> scannedRec2 = cursor.next();
             assertEquals(storedRec2, scannedRec2);
             assertFalse(cursor.hasNext());
-            cursor = recordStore.scanRecords(null, ScanProperties.REVERSE_SCAN);
+            cursor = recordStore.scanRecords(null, ScanProperties.REVERSE_SCAN).asIterator();
             assertTrue(cursor.hasNext());
             scannedRec2 = cursor.next();
             assertEquals(storedRec2, scannedRec2);
@@ -2414,12 +2633,12 @@ public class FDBRecordStoreTest extends FDBRecordStoreTestBase {
             assertTrue(recordStore.deleteRecord(Tuple.from(1066L)));
 
             // Scan should now have just the second record
-            cursor = recordStore.scanRecords(null, ScanProperties.FORWARD_SCAN);
+            cursor = recordStore.scanRecords(null, ScanProperties.FORWARD_SCAN).asIterator();
             assertTrue(cursor.hasNext());
             scannedRec2 = cursor.next();
             assertEquals(storedRec2, scannedRec2);
             assertFalse(cursor.hasNext());
-            cursor = recordStore.scanRecords(null, ScanProperties.REVERSE_SCAN);
+            cursor = recordStore.scanRecords(null, ScanProperties.REVERSE_SCAN).asIterator();
             assertTrue(cursor.hasNext());
             scannedRec2 = cursor.next();
             assertEquals(storedRec2, scannedRec2);
@@ -2676,6 +2895,307 @@ public class FDBRecordStoreTest extends FDBRecordStoreTestBase {
                     .open();
             assertEquals(version + 3, recordStore.getRecordMetaData().getVersion());
             recordStore.saveRecord(evolvedAgainRecord);
+        }
+    }
+
+    @Nonnull
+    private FDBMetaDataStore openMetaDataStore(@Nonnull FDBRecordContext context, @Nonnull KeySpacePath metaDataPath, boolean clear) {
+        FDBMetaDataStore metaDataStore = new FDBMetaDataStore(context, metaDataPath);
+        metaDataStore.setDependencies(new Descriptors.FileDescriptor[] {
+                RecordMetaDataOptionsProto.getDescriptor()
+        });
+        metaDataStore.setMaintainHistory(false);
+        if (clear) {
+            context.ensureActive().clear(Range.startsWith(metaDataPath.toSubspace(context).pack()));
+        }
+        return metaDataStore;
+    }
+
+    @Test
+    public void testNoUnion() {
+        final KeySpacePath metaDataPath = TestKeySpace.getKeyspacePath(new Object[]{"record-test", "unit", "metadataStore"});
+        int version;
+        try (FDBRecordContext context = fdb.openContext()) {
+            FDBMetaDataStore metaDataStore = openMetaDataStore(context, metaDataPath, true);
+            metaDataStore.saveRecordMetaData(TestNoUnionProto.getDescriptor());
+            context.commit();
+            assertNotNull(metaDataStore.getRecordMetaData().getRecordType("MySimpleRecord"));
+            version = metaDataStore.getRecordMetaData().getVersion();
+        }
+
+        // Store a MySimpleRecord record.
+        try (FDBRecordContext context = fdb.openContext()) {
+            FDBMetaDataStore metaDataStore = openMetaDataStore(context, metaDataPath, false);
+            FDBRecordStore recordStore = FDBRecordStore.newBuilder().setContext(context).setKeySpacePath(path)
+                    .setMetaDataStore(metaDataStore)
+                    .createOrOpen();
+            assertEquals(version, recordStore.getRecordMetaData().getVersion());
+            Descriptors.Descriptor mySimpleRecordDescriptor = recordStore.getRecordMetaData().getRecordType("MySimpleRecord").getDescriptor();
+            final Descriptors.FieldDescriptor recNo = mySimpleRecordDescriptor.findFieldByName("rec_no");
+            final Descriptors.FieldDescriptor numValue2 = mySimpleRecordDescriptor.findFieldByName("num_value_2");
+            final Descriptors.FieldDescriptor strValueIndexed = mySimpleRecordDescriptor.findFieldByName("str_value_indexed");
+            final Descriptors.FieldDescriptor numValue3Indexed = mySimpleRecordDescriptor.findFieldByName("num_value_3_indexed");
+            Message.Builder messageBuilder = DynamicMessage.newBuilder(mySimpleRecordDescriptor);
+            messageBuilder.setField(recNo, 1066L);
+            messageBuilder.setField(numValue2, 42);
+            messageBuilder.setField(strValueIndexed, "value");
+            messageBuilder.setField(numValue3Indexed, 1729);
+            recordStore.saveRecord(messageBuilder.build());
+        }
+
+        // Store another MySimpleRecord record with local file descriptor.
+        try (FDBRecordContext context = fdb.openContext()) {
+            FDBMetaDataStore metaDataStore = openMetaDataStore(context, metaDataPath, false);
+            metaDataStore.setLocalFileDescriptor(TestNoUnionProto.getDescriptor());
+            FDBRecordStore recordStore = FDBRecordStore.newBuilder().setContext(context).setKeySpacePath(path)
+                    .setMetaDataStore(metaDataStore)
+                    .createOrOpen();
+            assertEquals(version, recordStore.getRecordMetaData().getVersion());
+            TestNoUnionProto.MySimpleRecord record = TestNoUnionProto.MySimpleRecord.newBuilder()
+                    .setRecNo(1067L)
+                    .setNumValue2(43)
+                    .setStrValueIndexed("value2")
+                    .setNumValue3Indexed(1730)
+                    .build();
+            recordStore.saveRecord(record);
+        }
+
+        // Add a record type.
+        try (FDBRecordContext context = fdb.openContext()) {
+            FDBMetaDataStore metaDataStore = openMetaDataStore(context, metaDataPath, false);
+            assertNotNull(metaDataStore.getRecordMetaData().getRecordType("MySimpleRecord"));
+            assertEquals(version , metaDataStore.getRecordMetaData().getVersion());
+            DescriptorProtos.DescriptorProto newRecordType = DescriptorProtos.DescriptorProto.newBuilder()
+                    .setName("MyNewRecord")
+                    .addField(DescriptorProtos.FieldDescriptorProto.newBuilder()
+                            .setLabel(DescriptorProtos.FieldDescriptorProto.Label.LABEL_OPTIONAL)
+                            .setType(DescriptorProtos.FieldDescriptorProto.Type.TYPE_INT32)
+                            .setName("rec_no")
+                            .setNumber(1))
+                    .build();
+            metaDataStore.mutateMetaData(metaDataProto -> MetaDataProtoEditor.addRecordType(metaDataProto, newRecordType, Key.Expressions.field("rec_no")));
+            assertNotNull(metaDataStore.getRecordMetaData().getRecordType("MySimpleRecord"));
+            assertNotNull(metaDataStore.getRecordMetaData().getRecordType("MyNewRecord"));
+            assertEquals(version + 1 , metaDataStore.getRecordMetaData().getVersion());
+            assertEquals(version + 1 , metaDataStore.getRecordMetaData().getRecordType("MyNewRecord").getSinceVersion().intValue());
+            context.commit();
+        }
+
+        // Store a MyNewRecord record.
+        try (FDBRecordContext context = fdb.openContext()) {
+            FDBMetaDataStore metaDataStore = openMetaDataStore(context, metaDataPath, false);
+            FDBRecordStore recordStore = FDBRecordStore.newBuilder().setContext(context).setKeySpacePath(path)
+                    .setMetaDataStore(metaDataStore)
+                    .createOrOpen();
+            assertEquals(version + 1, recordStore.getRecordMetaData().getVersion());
+            Descriptors.Descriptor myNewRecordDescriptor = recordStore.getRecordMetaData().getRecordType("MyNewRecord").getDescriptor();
+            final Descriptors.FieldDescriptor recNo = myNewRecordDescriptor.findFieldByName("rec_no");
+            Message.Builder messageBuilder = DynamicMessage.newBuilder(myNewRecordDescriptor);
+            messageBuilder.setField(recNo, 2345);
+            recordStore.saveRecord(messageBuilder.build());
+        }
+    }
+
+    @Test
+    public void metaDataVersionZero() throws Exception {
+        final RecordMetaDataBuilder metaData = RecordMetaData.newBuilder().setRecords(TestNoIndexesProto.getDescriptor());
+        metaData.setVersion(0);
+
+        FDBRecordStore.Builder builder = FDBRecordStore.newBuilder()
+                .setKeySpacePath(path)
+                .setMetaDataProvider(metaData);
+
+        final FDBRecordStoreBase.UserVersionChecker newStore = new FDBRecordStoreBase.UserVersionChecker() {
+            @Override
+            public CompletableFuture<Integer> checkUserVersion(int oldUserVersion, int oldMetaDataVersion, RecordMetaDataProvider metaData) {
+                assertEquals(-1, oldUserVersion);
+                assertEquals(-1, oldMetaDataVersion);
+                return CompletableFuture.completedFuture(0);
+            }
+        };
+
+        try (FDBRecordContext context = openContext()) {
+            recordStore = builder.setContext(context).setUserVersionChecker(newStore).create();
+            assertTrue(recordStore.getRecordStoreState().getStoreHeader().hasMetaDataversion());
+            assertTrue(recordStore.getRecordStoreState().getStoreHeader().hasUserVersion());
+            commit(context);
+        }
+
+        final FDBRecordStoreBase.UserVersionChecker oldStore = new FDBRecordStoreBase.UserVersionChecker() {
+            @Override
+            public CompletableFuture<Integer> checkUserVersion(int oldUserVersion, int oldMetaDataVersion, RecordMetaDataProvider metaData) {
+                assertEquals(0, oldUserVersion);
+                assertEquals(0, oldMetaDataVersion);
+                return CompletableFuture.completedFuture(0);
+            }
+        };
+
+        try (FDBRecordContext context = openContext()) {
+            recordStore = builder.setContext(context).setUserVersionChecker(oldStore).open();
+            commit(context);
+        }
+    }
+
+    @Test
+    public void updateLastUpdatedTime() throws Exception {
+        RecordMetaDataHook hook = metaDataBuilder -> metaDataBuilder.addIndex("MySimpleRecord", "num_value_2");
+
+        long firstUpdateTime;
+        int metaDataVersion;
+        try (FDBRecordContext context = openContext()) {
+            final long beforeOpenTime = System.currentTimeMillis();
+            openSimpleRecordStore(context);
+            metaDataVersion = recordStore.getRecordMetaData().getVersion();
+            firstUpdateTime = recordStore.getRecordStoreState().getStoreHeader().getLastUpdateTime();
+            assertThat(firstUpdateTime, greaterThanOrEqualTo(beforeOpenTime));
+            commit(context);
+        }
+
+        try (FDBRecordContext context = openContext()) {
+            final long beforeOpenTime = System.currentTimeMillis();
+            assumeTrue(firstUpdateTime < beforeOpenTime, "time has not advanced since first update");
+            openSimpleRecordStore(context, hook);
+            assertEquals(metaDataVersion + 1, recordStore.getRecordMetaData().getVersion());
+            long secondUpdateTime = recordStore.getRecordStoreState().getStoreHeader().getLastUpdateTime();
+            assertThat(secondUpdateTime, greaterThan(firstUpdateTime));
+            commit(context);
+        }
+    }
+
+    /**
+     * Test mode for {@link #clearOmitUnsplitRecordSuffix(ClearOmitUnsplitRecordSuffixMode)}.
+     */
+    public enum ClearOmitUnsplitRecordSuffixMode {
+        EMPTY, SAVE, DELETE
+    }
+
+    @EnumSource(ClearOmitUnsplitRecordSuffixMode.class)
+    @ParameterizedTest(name = "clearOmitUnsplitRecordSuffix [mode = {0}]")
+    public void clearOmitUnsplitRecordSuffix(ClearOmitUnsplitRecordSuffixMode mode) throws Exception {
+        final RecordMetaDataBuilder metaData = RecordMetaData.newBuilder().setRecords(TestRecords1Proto.getDescriptor());
+
+        FDBRecordStore.Builder builder = FDBRecordStore.newBuilder()
+                .setKeySpacePath(path)
+                .setMetaDataProvider(metaData)
+                .setFormatVersion(FDBRecordStore.FORMAT_CONTROL_FORMAT_VERSION);
+
+        try (FDBRecordContext context = openContext()) {
+            recordStore = builder.setContext(context).create();
+            if (mode != ClearOmitUnsplitRecordSuffixMode.EMPTY) {
+                TestRecords1Proto.MySimpleRecord record = TestRecords1Proto.MySimpleRecord.newBuilder()
+                        .setRecNo(1L)
+                        .setStrValueIndexed("abc")
+                        .build();
+                recordStore.saveRecord(record);
+            }
+            commit(context);
+        }
+
+        if (mode == ClearOmitUnsplitRecordSuffixMode.DELETE) {
+            try (FDBRecordContext context = openContext()) {
+                recordStore = builder.setContext(context).open();
+                recordStore.deleteRecord(Tuple.from(1L));
+                commit(context);
+            }
+        }
+
+        metaData.addIndex("MySimpleRecord", "num_value_2");
+        builder.setFormatVersion(FDBRecordStore.MAX_SUPPORTED_FORMAT_VERSION);
+
+        try (FDBRecordContext context = openContext()) {
+            recordStore = builder.setContext(context).open();
+            assertEquals(mode == ClearOmitUnsplitRecordSuffixMode.SAVE,
+                    recordStore.getRecordStoreState().getStoreHeader().getOmitUnsplitRecordSuffix());
+        }
+    }
+
+    @Test
+    public void clearOmitUnsplitRecordSuffixTyped() throws Exception {
+        final RecordMetaDataBuilder metaData = RecordMetaData.newBuilder().setRecords(TestRecords1Proto.getDescriptor());
+        final KeyExpression pkey = concat(Key.Expressions.recordType(), field("rec_no"));
+        metaData.getRecordType("MySimpleRecord").setPrimaryKey(pkey);
+        metaData.getRecordType("MyOtherRecord").setPrimaryKey(pkey);
+
+        FDBRecordStore.Builder builder = FDBRecordStore.newBuilder()
+                .setKeySpacePath(path)
+                .setMetaDataProvider(metaData)
+                .setFormatVersion(FDBRecordStore.FORMAT_CONTROL_FORMAT_VERSION);
+
+        final FDBStoredRecord<Message> saved;
+        try (FDBRecordContext context = openContext()) {
+            recordStore = builder.setContext(context).create();
+            TestRecords1Proto.MyOtherRecord record = TestRecords1Proto.MyOtherRecord.newBuilder()
+                        .setRecNo(1L)
+                        .build();
+            saved = recordStore.saveRecord(record);
+            commit(context);
+        }
+
+        metaData.addIndex("MySimpleRecord", "num_value_2");
+        builder.setFormatVersion(FDBRecordStore.MAX_SUPPORTED_FORMAT_VERSION);
+
+        try (FDBRecordContext context = openContext()) {
+            recordStore = builder.setContext(context).open();
+            FDBStoredRecord<Message> loaded = recordStore.loadRecord(saved.getPrimaryKey());
+            assertNotNull(loaded);
+            assertEquals(saved.getRecord(), loaded.getRecord());
+            assertTrue(recordStore.getRecordStoreState().getStoreHeader().getOmitUnsplitRecordSuffix());
+        }
+    }
+
+    @Test
+    public void clearOmitUnsplitRecordSuffixOverlapping() throws Exception {
+        final RecordMetaDataBuilder metaData = RecordMetaData.newBuilder().setRecords(TestRecords1Proto.getDescriptor());
+
+        FDBRecordStore.Builder builder = FDBRecordStore.newBuilder()
+                .setKeySpacePath(path)
+                .setMetaDataProvider(metaData)
+                .setFormatVersion(FDBRecordStore.FORMAT_CONTROL_FORMAT_VERSION);
+
+        try (FDBRecordContext context = openContext()) {
+            recordStore = builder.setContext(context).create();
+            commit(context);
+        }
+
+        FDBRecordContext context1 = openContext();
+        FDBRecordStore recordStore = builder.setContext(context1).open();
+        TestRecords1Proto.MySimpleRecord record = TestRecords1Proto.MySimpleRecord.newBuilder()
+                .setRecNo(1L)
+                .setStrValueIndexed("abc")
+                .build();
+        FDBStoredRecord<Message> saved = recordStore.saveRecord(record);
+
+        metaData.addIndex("MySimpleRecord", "num_value_2");
+        builder.setFormatVersion(FDBRecordStore.MAX_SUPPORTED_FORMAT_VERSION);
+
+        // If we did build, we'd create a read confict on the new index.
+        // We want to test that a conflict comes from the clearing itself.
+        final FDBRecordStoreBase.UserVersionChecker dontBuild = new FDBRecordStoreBase.UserVersionChecker() {
+            @Override
+            public CompletableFuture<Integer> checkUserVersion(int oldUserVersion, int oldMetaDataVersion, RecordMetaDataProvider metaData) {
+                return CompletableFuture.completedFuture(0);
+            }
+
+            @Override
+            public IndexState needRebuildIndex(Index index, long recordCount, boolean indexOnNewRecordTypes) {
+                return IndexState.DISABLED;
+            }
+        };
+        builder.setUserVersionChecker(dontBuild);
+
+        FDBRecordContext context2 = openContext();
+        FDBRecordStore recordStore2 = builder.setContext(context2).open();
+        assertFalse(recordStore2.getRecordStoreState().getStoreHeader().getOmitUnsplitRecordSuffix());
+
+        commit(context1);
+        assertThrows(FDBExceptions.FDBStoreTransactionConflictException.class, () -> commit(context2));
+
+        try (FDBRecordContext context = openContext()) {
+            recordStore = builder.setContext(context).open();
+            FDBStoredRecord<Message> loaded = recordStore.loadRecord(saved.getPrimaryKey());
+            assertNotNull(loaded);
+            assertEquals(saved.getRecord(), loaded.getRecord());
+            assertTrue(recordStore.getRecordStoreState().getStoreHeader().getOmitUnsplitRecordSuffix());
         }
     }
 }

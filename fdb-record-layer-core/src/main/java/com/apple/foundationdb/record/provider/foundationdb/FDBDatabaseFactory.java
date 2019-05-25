@@ -20,12 +20,14 @@
 
 package com.apple.foundationdb.record.provider.foundationdb;
 
-import com.apple.foundationdb.API;
 import com.apple.foundationdb.FDB;
 import com.apple.foundationdb.NetworkOptions;
+import com.apple.foundationdb.annotation.API;
 import com.apple.foundationdb.record.RecordCoreException;
 import com.apple.foundationdb.record.SpotBugsSuppressWarnings;
 import com.apple.foundationdb.record.logging.KeyValueLogMessage;
+import com.apple.foundationdb.record.provider.foundationdb.storestate.FDBRecordStoreStateCacheFactory;
+import com.apple.foundationdb.record.provider.foundationdb.storestate.PassThroughRecordStoreStateCacheFactory;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -36,6 +38,7 @@ import java.util.Map;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Function;
 import java.util.function.Supplier;
 
 /**
@@ -45,14 +48,20 @@ import java.util.function.Supplier;
 public class FDBDatabaseFactory {
     private static final Logger LOGGER = LoggerFactory.getLogger(FDBDatabaseFactory.class);
 
+    protected static final Function<FDBLatencySource, Long> DEFAULT_LATENCY_INJECTOR = api -> 0L;
+
     /**
      * The default number of entries that is to be cached, per database, from
      * {@link com.apple.foundationdb.record.provider.foundationdb.keyspace.LocatableResolver} retrieval requests.
      */
     public static final int DEFAULT_DIRECTORY_CACHE_SIZE = 5000;
+    private static final int API_VERSION = 600;
 
     @Nonnull
     private static final FDBDatabaseFactory INSTANCE = new FDBDatabaseFactory();
+
+    @Nonnull
+    private FDBLocalityProvider localityProvider = FDBLocalityUtil.instance();
 
     /* Next few null until initFDB is called */
 
@@ -83,8 +92,15 @@ public class FDBDatabaseFactory {
      * The default is a log-based predicate, which can also be used to enable tracing on a more granular level
      * (such as by request) using {@link #setTransactionIsTracedSupplier(Supplier)}.
      */
+    @Nonnull
     private Supplier<Boolean> transactionIsTracedSupplier = LOGGER::isTraceEnabled;
+    @Nonnull
     private Supplier<BlockingInAsyncDetection> blockingInAsyncDetectionSupplier = () -> BlockingInAsyncDetection.DISABLED;
+    @Nonnull
+    private FDBRecordStoreStateCacheFactory storeStateCacheFactory = PassThroughRecordStoreStateCacheFactory.instance();
+
+    @Nonnull
+    private Function<FDBLatencySource, Long> latencyInjector = DEFAULT_LATENCY_INJECTOR;
 
     private final Map<String, FDBDatabase> databases = new HashMap<>();
 
@@ -99,7 +115,7 @@ public class FDBDatabaseFactory {
             if (LOGGER.isDebugEnabled()) {
                 LOGGER.debug(KeyValueLogMessage.of("Starting FDB"));
             }
-            fdb = FDB.selectAPIVersion(520);
+            fdb = FDB.selectAPIVersion(API_VERSION);
             fdb.setUnclosedWarning(unclosedWarning);
             NetworkOptions options = fdb.options();
             if (traceDirectory != null) {
@@ -389,6 +405,37 @@ public class FDBDatabaseFactory {
         return this.blockingInAsyncDetectionSupplier;
     }
 
+    /**
+     * Provides a function that computes a latency that should be injected into a specific FDB operation.  The
+     * provided function takes a {@link FDBLatencySource} as input and returns the number of milliseconds delay that should
+     * be injected before the operation completes.  Returning a value of zero or less indicates that no delay should
+     * be injected.
+     *
+     * <p>Latency injection can be useful for simulating environments in which FDB is under stress or in a
+     * configuration in which latency is inherent in its operation.
+     *
+     * @param latencyInjector a function computing the latency to be injected into an operation
+     */
+    public void setLatencyInjector(@Nonnull Function<FDBLatencySource, Long> latencyInjector) {
+        this.latencyInjector = latencyInjector;
+    }
+
+    /**
+     * Returns the current latency injector.
+     *
+     * @return the current latency injector
+     */
+    public Function<FDBLatencySource, Long> getLatencyInjector() {
+        return latencyInjector;
+    }
+
+    /**
+     * Removes any previously installed latency injector.
+     */
+    public void clearLatencyInjector() {
+        this.latencyInjector = DEFAULT_LATENCY_INJECTOR;
+    }
+
     public long getStateRefreshTimeMillis() {
         return stateRefreshTimeMillis;
     }
@@ -402,6 +449,34 @@ public class FDBDatabaseFactory {
         this.stateRefreshTimeMillis = stateRefreshTimeMillis;
     }
 
+    /**
+     * Get the store state cache factory. Each {@link FDBDatabase} produced by this {@code FDBDatabaseFactory} will be
+     * initialized with an {@link com.apple.foundationdb.record.provider.foundationdb.storestate.FDBRecordStoreStateCache FDBRecordStoreStateCache}
+     * from this cache factory. By default, the factory is a {@link PassThroughRecordStoreStateCacheFactory} which means
+     * that the record store state information is never cached.
+     *
+     * @return the factory of {@link com.apple.foundationdb.record.provider.foundationdb.storestate.FDBRecordStoreStateCache FDBRecordStoreStateCache}s
+     *      used when initializing {@link FDBDatabase}s
+     */
+    @API(API.Status.EXPERIMENTAL)
+    @Nonnull
+    public FDBRecordStoreStateCacheFactory getStoreStateCacheFactory() {
+        return storeStateCacheFactory;
+    }
+
+    /**
+     * Set the store state cache factory. Each {@link FDBDatabase} produced by this {@code FDBDatabaseFactory} will be
+     * initialized with an {@link com.apple.foundationdb.record.provider.foundationdb.storestate.FDBRecordStoreStateCache FDBRecordStoreStateCache}
+     * from the cache factory provided.
+     *
+     * @param storeStateCacheFactory a factory of {@link com.apple.foundationdb.record.provider.foundationdb.storestate.FDBRecordStoreStateCache FDBRecordStoreStateCache}s
+     *      to use when initializing {@link FDBDatabase}s
+     * @see com.apple.foundationdb.record.provider.foundationdb.storestate.FDBRecordStoreStateCache
+     */
+    @API(API.Status.EXPERIMENTAL)
+    public void setStoreStateCacheFactory(@Nonnull FDBRecordStoreStateCacheFactory storeStateCacheFactory) {
+        this.storeStateCacheFactory = storeStateCacheFactory;
+    }
 
     @Nonnull
     public synchronized FDBDatabase getDatabase(@Nullable String clusterFile) {
@@ -412,6 +487,7 @@ public class FDBDatabaseFactory {
             database.setTrackLastSeenVersion(getTrackLastSeenVersion());
             database.setResolverStateRefreshTimeMillis(getStateRefreshTimeMillis());
             database.setDatacenterId(getDatacenterId());
+            database.setStoreStateCache(storeStateCacheFactory.getCache(database));
             databases.put(clusterFile, database);
         }
         return database;
@@ -420,5 +496,23 @@ public class FDBDatabaseFactory {
     @Nonnull
     public synchronized FDBDatabase getDatabase() {
         return getDatabase(null);
+    }
+
+    /**
+     * Get the locality provider that is used to discover the server location of the keys.
+     * @return the installed locality provider
+     */
+    @Nonnull
+    public FDBLocalityProvider getLocalityProvider() {
+        return localityProvider;
+    }
+
+    /**
+     * Set the locality provider that is used to discover the server location of the keys.
+     * @param localityProvider the locality provider
+     * @see FDBLocalityUtil
+     */
+    public void setLocalityProvider(@Nonnull FDBLocalityProvider localityProvider) {
+        this.localityProvider = localityProvider;
     }
 }

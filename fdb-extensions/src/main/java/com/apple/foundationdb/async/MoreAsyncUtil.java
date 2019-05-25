@@ -20,7 +20,7 @@
 
 package com.apple.foundationdb.async;
 
-import com.apple.foundationdb.API;
+import com.apple.foundationdb.annotation.API;
 import com.apple.foundationdb.util.LoggableException;
 import com.google.common.util.concurrent.ThreadFactoryBuilder;
 
@@ -29,6 +29,7 @@ import javax.annotation.Nullable;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Iterator;
 import java.util.List;
 import java.util.NoSuchElementException;
 import java.util.Queue;
@@ -415,7 +416,7 @@ public class MoreAsyncUtil {
                         nextFuture = whileTrue(() -> {
                             List<CompletableFuture<Boolean>> waitOn = new ArrayList<>(2);
                             CompletableFuture<Boolean> outer = iterator.onHasNext();
-                            if (outer.isDone()) {
+                            if (isCompletedNormally(outer)) {
                                 if (outer.getNow(false) && (pipeline.size() < pipelineSize)) {
                                     AsyncIterator<T2> next = func.apply(iterator.next()).iterator();
                                     pipeline.add(next);
@@ -430,7 +431,7 @@ public class MoreAsyncUtil {
                             AsyncIterator<T2> current = pipeline.peek();
                             if (current != null) {
                                 inner = current.onHasNext();
-                                if (inner.isDone()) {
+                                if (isCompletedNormally(inner)) {
                                     if (inner.getNow(false)) {
                                         // inner onHasNext returned true, break out of whileTrue
                                         return AsyncUtil.READY_FALSE; // First available
@@ -809,7 +810,9 @@ public class MoreAsyncUtil {
 
     /**
      * Get a completable future that will either complete within the specified deadline time or complete exceptionally
-     * with {@link DeadlineExceededException}.
+     * with {@link DeadlineExceededException}. If {@code deadlineTimeMillis} is set to {@link Long#MAX_VALUE}, then
+     * no deadline is imposed on the future.
+     *
      * @param deadlineTimeMillis the maximum time to wait for the asynchronous operation to complete, specified in milliseconds
      * @param supplier the {@link Supplier} of the asynchronous result
      * @param <T> the return type for the get operation
@@ -820,7 +823,9 @@ public class MoreAsyncUtil {
     public static <T> CompletableFuture<T> getWithDeadline(long deadlineTimeMillis,
                                                            @Nonnull Supplier<CompletableFuture<T>> supplier) {
         final CompletableFuture<T> valueFuture = supplier.get();
-
+        if (deadlineTimeMillis == Long.MAX_VALUE) {
+            return valueFuture;
+        }
         return CompletableFuture.anyOf(MoreAsyncUtil.delayedFuture(deadlineTimeMillis, TimeUnit.MILLISECONDS), valueFuture)
                 .thenCompose(ignore -> {
                     if (!valueFuture.isDone()) {
@@ -836,11 +841,19 @@ public class MoreAsyncUtil {
      * @param iterator iterator to close
      */
     @API(API.Status.MAINTAINED)
-    public static void closeIterator(@Nonnull AsyncIterator<?> iterator) {
+    public static void closeIterator(@Nonnull Iterator<?> iterator) {
         if (iterator instanceof CloseableAsyncIterator) {
             ((CloseableAsyncIterator<?>)iterator).close();
-        } else {
-            iterator.cancel();
+        } else if (iterator instanceof AsyncIterator) {
+            ((AsyncIterator<?>)iterator).cancel();
+        } else if (iterator instanceof AutoCloseable) {
+            try {
+                ((AutoCloseable)iterator).close();
+            } catch (RuntimeException ex) {
+                throw ex;
+            } catch (Exception ex) {
+                throw new RuntimeException(ex.getMessage(), ex);
+            }
         }
     }
 

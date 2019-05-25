@@ -20,12 +20,13 @@
 
 package com.apple.foundationdb.record;
 
-import com.apple.foundationdb.API;
+import com.apple.foundationdb.annotation.API;
 import com.apple.foundationdb.async.MoreAsyncUtil;
 import com.google.common.cache.Cache;
 import com.google.common.cache.CacheBuilder;
 
 import javax.annotation.Nonnull;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
@@ -37,39 +38,72 @@ import java.util.function.Supplier;
  */
 @API(API.Status.UNSTABLE)
 public class AsyncLoadingCache<K, V> {
+    /**
+     * The default deadline to impose on loading elements.
+     */
+    public static final long DEFAULT_DEADLINE_TIME_MILLIS = 5000L;
+    /**
+     * A constant to indicate that an operation should not have a limit. For example, this can be provided
+     * to the cache as the deadline time or the max size to indicate that no deadline should be imposed
+     * on futures loading entries into the cache or that there should not be a maximum number of cached
+     * elements.
+     */
+    public static final long UNLIMITED = Long.MAX_VALUE;
+
     @Nonnull
-    private final Cache<K, CompletableFuture<V>> cache;
+    private final Cache<K, Optional<V>> cache;
     private final long refreshTimeMillis;
     private final long deadlineTimeMillis;
+    private final long maxSize;
 
     public AsyncLoadingCache(long refreshTimeMillis) {
-        this(refreshTimeMillis, 5000L);
+        this(refreshTimeMillis, DEFAULT_DEADLINE_TIME_MILLIS);
     }
 
     public AsyncLoadingCache(long refreshTimeMillis, long deadlineTimeMillis) {
+        this(refreshTimeMillis, deadlineTimeMillis, UNLIMITED);
+    }
+
+    public AsyncLoadingCache(long refreshTimeMillis, long deadlineTimeMillis, long maxSize) {
         this.refreshTimeMillis = refreshTimeMillis;
         this.deadlineTimeMillis = deadlineTimeMillis;
-        cache = CacheBuilder.newBuilder().expireAfterWrite(this.refreshTimeMillis, TimeUnit.MILLISECONDS).build();
+        this.maxSize = maxSize;
+        CacheBuilder<Object, Object> cacheBuilder = CacheBuilder.newBuilder()
+                .expireAfterWrite(this.refreshTimeMillis, TimeUnit.MILLISECONDS);
+        if (maxSize != UNLIMITED) {
+            cacheBuilder.maximumSize(maxSize);
+        }
+        cache = cacheBuilder.build();
     }
 
     /**
      * If the cache does not contain an entry for <code>key</code>, retrieve the value using the provided asynchronous
-     * {@link Supplier}. The future returned by the supplier is cached immediately, this is to prevent concurrent
-     * attempts to get the value from doing unnecessary (and potentially expensive) work. If the returned asynchronous
-     * operation completes exceptionally, the key will be cleared.
+     * {@link Supplier}. If the value is not currently cached, then the {@code Supplier} is used to load the value
+     * asynchronously. If multiple callers ask for the same key at the same time, then they might duplicate
+     * each other's work in that both callers will result in a future being created. Whichever future completes first
+     * will insert its value into the cache, and all callers that then complete successfully are guaranteed to see that
+     * object until such time as the value is expired from the cache.
      *
      * @param key the key in the cache to lookup
      * @param supplier an asynchronous operation to retrieve the desired value if the cache is empty
      *
      * @return a future containing either the cached value or the result from the supplier
      */
+    @SuppressWarnings("squid:S2789") // comparison of null and optional used to differentiate absence of key and presence of null
+    @Nonnull
     public CompletableFuture<V> orElseGet(@Nonnull K key, @Nonnull Supplier<CompletableFuture<V>> supplier) {
         try {
-            return cache.get(key, () -> MoreAsyncUtil.getWithDeadline(deadlineTimeMillis, supplier)).whenComplete((ignored, e) -> {
-                if (e != null) {
-                    cache.invalidate(key);
-                }
-            });
+            Optional<V> cachedValue = cache.getIfPresent(key);
+            if (cachedValue == null) {
+                return MoreAsyncUtil.getWithDeadline(deadlineTimeMillis, supplier).thenApply(value -> {
+                    // Only insert the computed value into the cache if a concurrent caller hasn't.
+                    // Return the value that wound up in the cache.
+                    final Optional<V> existingValue = cache.asMap().putIfAbsent(key, Optional.ofNullable(value));
+                    return existingValue == null ? value : existingValue.orElse(null);
+                });
+            } else {
+                return CompletableFuture.completedFuture(cachedValue.orElse(null));
+            }
         } catch (Exception e) {
             throw new RecordCoreException("failed getting value", e).addLogInfo("cacheKey", key);
         }
@@ -77,6 +111,16 @@ public class AsyncLoadingCache<K, V> {
 
     public long getRefreshTimeSeconds() {
         return TimeUnit.MILLISECONDS.toSeconds(refreshTimeMillis);
+    }
+
+    /**
+     * Get the maximum number of elements stored by the cache. This will return {@link Long#MAX_VALUE} if there
+     * is no maximum size enforced by this cache.
+     *
+     * @return the maximum number of elements stored by the cache
+     */
+    public long getMaxSize() {
+        return maxSize;
     }
 
     public void clear() {

@@ -20,7 +20,7 @@
 
 package com.apple.foundationdb.record.provider.foundationdb;
 
-import com.apple.foundationdb.API;
+import com.apple.foundationdb.annotation.API;
 import com.apple.foundationdb.record.provider.common.RecordSerializer;
 import com.apple.foundationdb.record.provider.common.StoreTimer;
 import com.apple.foundationdb.record.provider.foundationdb.keyspace.ExtendedDirectoryLayer;
@@ -48,10 +48,12 @@ public class FDBStoreTimer extends StoreTimer {
         SAVE_META_DATA("save meta-data"),
         /** The amount of time taken loading meta-data from a {@link FDBMetaDataStore}. */
         LOAD_META_DATA("load meta-data"),
-        /** The amount of time taken loading a record store's {@code DataStoreInfo} header. */
-        LOAD_RECORD_STORE_INFO("load record store info"),
-        /** The amount of time taken loading a record store's {@link com.apple.foundationdb.record.RecordStoreState} listing inactive indexes. */
+        /** The amount of time taken loading a record store's {@link com.apple.foundationdb.record.RecordStoreState} listing store-specific information. */
         LOAD_RECORD_STORE_STATE("load record store state"),
+        /** The amount of time taken loading a record store's {@code DataStoreInfo} header.*/
+        LOAD_RECORD_STORE_INFO("load record store info"),
+        /** The amount of time taken loading a record store's index meta-data. */
+        LOAD_RECORD_STORE_INDEX_META_DATA("load record store index meta-data"),
         /** The amount of time taken getting the current version from a {@link MetaDataCache}. */
         GET_META_DATA_CACHE_VERSION("get meta-data cache version"),
         /** The amount of time taken getting cached meta-data from a {@link MetaDataCache}. */
@@ -82,7 +84,7 @@ public class FDBStoreTimer extends StoreTimer {
          * for later committing.
          */
         DELETE_RECORD("delete record"),
-        // TODO: Are these index maintanenace related ones really DetailEvents?
+        // TODO: Are these index maintenance related ones really DetailEvents?
         /** The amount of time spent maintaining an index when the entire record is skipped by the {@link IndexMaintenanceFilter}. */
         SKIP_INDEX_RECORD("skip index record"),
         /** The amount of time spent maintaining an index when an entry is skipped by the {@link IndexMaintenanceFilter}. */
@@ -234,6 +236,8 @@ public class FDBStoreTimer extends StoreTimer {
         WAIT_CHECK_VERSION("wait for check version"),
         /** Wait for {@link OnlineIndexer} to complete building an index. */
         WAIT_ONLINE_BUILD_INDEX("wait for online build index"),
+        /** Wait for {@link OnlineIndexer} to build endpoints. */
+        WAIT_BUILD_ENDPOINTS("wait for building endpoints"),
         /** Wait for a record scan without an index. */
         WAIT_SCAN_RECORDS("wait for scan records"),
         /** Wait for a indexed record scan. */
@@ -254,6 +258,12 @@ public class FDBStoreTimer extends StoreTimer {
         WAIT_DROP_INDEX("wait for dropping an index"),
         /** Wait for updating records descriptor. */
         WAIT_UPDATE_RECORDS_DESCRIPTOR("wait for updating the records descriptor"),
+        /** Wait for meta-data mutation. */
+        WAIT_MUTATE_METADATA("wait for meta-data mutation"),
+        /** Wait for updating if record versions should be stored. */
+        WAIT_UPDATE_STORE_RECORD_VERSIONS("wait for updating if record versions must be stored"),
+        /** Wait for enabling splitting long records. */
+        WAIT_ENABLE_SPLIT_LONG_RECORDS("wait for enabling splitting long records"),
         /**
          * Wait for the updated version stamp from a committed transaction.
          * This future should normally be completed already, so this is mainly for error checking.
@@ -275,8 +285,11 @@ public class FDBStoreTimer extends StoreTimer {
         WAIT_LOCATABLE_RESOLVER_MAPPING_COPY("wait for copying contents of directory layer"),
         /** Wait for a backoff delay on retryable error in {@link FDBDatabase#run}. */
         WAIT_RETRY_DELAY("wait for retry delay"),
-        /** Wait for statistics to be collected by a {@link SizeStatisticsCollector}. */
-        WAIT_COLLECT_STATISTICS("wait for statistics to be collected of a record store or index");
+        /** Wait for statistics to be collected. */
+        WAIT_COLLECT_STATISTICS("wait for statistics to be collected of a record store or index"),
+        /** Wait for getting boundaries. */
+        WAIT_GET_BOUNDARY("wait for boundary result from locality api"),
+        ;
 
         private final String title;
         Waits(String title) {
@@ -299,6 +312,10 @@ public class FDBStoreTimer extends StoreTimer {
         CLOSE_CONTEXT("open record context", false),
         /** The number of times a record store is created in the database. */
         CREATE_RECORD_STORE("create record store", false),
+        /** The number of times the store state cache returned a cached result. */
+        STORE_STATE_CACHE_HIT("store info cache hit", false),
+        /** The number of times the store state cache was unable to return a cached result. */
+        STORE_STATE_CACHE_MISS("store info cache miss", false),
         /** The number of record key-value pairs saved. */
         SAVE_RECORD_KEY("number of record keys saved", false),
         /** The size of keys for record key-value pairs saved. */
@@ -429,6 +446,14 @@ public class FDBStoreTimer extends StoreTimer {
         TIME_WINDOW_LEADERBOARD_OVERLAPPING_CHANGED("number of leaderboard conditional rebuilds", false),
         /** The number of times that an index entry does not point to a valid record. */
         BAD_INDEX_ENTRY("number of occurrences of bad index entries", false),
+        /** The number of record keys repaired by {@link FDBRecordStore#repairRecordKeys(byte[], com.apple.foundationdb.record.ScanProperties)}. */
+        REPAIR_RECORD_KEY("repair record key", false),
+        /** The number of record keys with an invalid split suffix found by {@link FDBRecordStore#repairRecordKeys(byte[], com.apple.foundationdb.record.ScanProperties)}. */
+        INVALID_SPLIT_SUFFIX("invalid split suffix", false),
+        /** The number of record keys with an incorrect length found by {@link FDBRecordStore#repairRecordKeys(byte[], com.apple.foundationdb.record.ScanProperties)}. */
+        INVALID_KEY_LENGTH("invalid record key", false),
+        /** The number of indexes that need to be rebuilt in the record store. */
+        INDEXES_NEED_REBUILDING("indexes need rebuilding", false),
         ;
 
         private final String title;

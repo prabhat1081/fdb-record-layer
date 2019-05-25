@@ -20,15 +20,16 @@
 
 package com.apple.foundationdb.record.provider.foundationdb;
 
-import com.apple.foundationdb.API;
 import com.apple.foundationdb.KeyValue;
 import com.apple.foundationdb.MutationType;
 import com.apple.foundationdb.Range;
 import com.apple.foundationdb.ReadTransaction;
 import com.apple.foundationdb.Transaction;
+import com.apple.foundationdb.annotation.API;
 import com.apple.foundationdb.async.AsyncIterable;
 import com.apple.foundationdb.async.AsyncIterator;
 import com.apple.foundationdb.async.AsyncUtil;
+import com.apple.foundationdb.async.CloseableAsyncIterator;
 import com.apple.foundationdb.async.MoreAsyncUtil;
 import com.apple.foundationdb.async.RangeSet;
 import com.apple.foundationdb.record.ByteScanLimiter;
@@ -43,6 +44,7 @@ import com.apple.foundationdb.record.IndexState;
 import com.apple.foundationdb.record.IsolationLevel;
 import com.apple.foundationdb.record.MutableRecordStoreState;
 import com.apple.foundationdb.record.PipelineOperation;
+import com.apple.foundationdb.record.RecordCoreArgumentException;
 import com.apple.foundationdb.record.RecordCoreException;
 import com.apple.foundationdb.record.RecordCoreStorageException;
 import com.apple.foundationdb.record.RecordCursor;
@@ -73,6 +75,7 @@ import com.apple.foundationdb.record.metadata.expressions.KeyExpression;
 import com.apple.foundationdb.record.provider.common.DynamicMessageRecordSerializer;
 import com.apple.foundationdb.record.provider.common.RecordSerializer;
 import com.apple.foundationdb.record.provider.foundationdb.keyspace.KeySpacePath;
+import com.apple.foundationdb.record.provider.foundationdb.storestate.FDBRecordStoreStateCache;
 import com.apple.foundationdb.record.query.QueryToKeyMatcher;
 import com.apple.foundationdb.record.query.RecordQuery;
 import com.apple.foundationdb.record.query.expressions.AndComponent;
@@ -82,6 +85,7 @@ import com.apple.foundationdb.record.query.expressions.RecordTypeKeyComparison;
 import com.apple.foundationdb.record.query.plan.RecordQueryPlanner;
 import com.apple.foundationdb.record.query.plan.plans.RecordQueryPlan;
 import com.apple.foundationdb.subspace.Subspace;
+import com.apple.foundationdb.tuple.ByteArrayUtil;
 import com.apple.foundationdb.tuple.ByteArrayUtil2;
 import com.apple.foundationdb.tuple.Tuple;
 import com.apple.foundationdb.tuple.TupleHelpers;
@@ -92,6 +96,7 @@ import com.google.common.collect.ImmutableMap;
 import com.google.protobuf.Descriptors;
 import com.google.protobuf.InvalidProtocolBufferException;
 import com.google.protobuf.Message;
+import org.apache.commons.lang3.tuple.Pair;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -109,13 +114,33 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
 
 /**
  * A multi-type record store.
  *
- * Uses Protobuf dynamic messages to process records.
+ * By default, this uses Protobuf dynamic messages to process records. However, one can specify a custom {@link RecordSerializer}
+ * such as a {@link com.apple.foundationdb.record.provider.common.MessageBuilderRecordSerializer MessageBuilderRecordSerializer}
+ * or a {@link com.apple.foundationdb.record.provider.common.TransformedRecordSerializer TransformedRecordSerializer} to use
+ * as an alternative. Unlike the serializers used by an {@link FDBTypedRecordStore} which only need to be able to process records
+ * of the appropriate record type, the provided serializer must be able to serialize and deseralize all record types specified by
+ * the record store's {@link RecordMetaData}.
+ *
+ * <p>
+ * <b>Warning</b>: It is unsafe to create and use two {@code FDBRecordStore}s concurrently over the same {@link Subspace}
+ * within the context of a single transaction, i.e., with the same {@link FDBRecordContext}. This is because the {@code FDBRecordStore}
+ * object maintains state about certain uncommitted operations, and concurrent access through two objects will not see
+ * changes to this in-memory state. See <a href="https://github.com/FoundationDB/fdb-record-layer/issues/489">Issue #489</a>
+ * for more details. Note also that the record stores returned by {@link #getTypedRecordStore(RecordSerializer)} and
+ * {@link #getUntypedRecordStore()} will share an {@code FDBRecordStore} with the record store on which they are called,
+ * so it <em>is</em> safe to have a typed- and untyped-record store open over the same {@code Subspace} within the context
+ * of the same transaction if one uses one of those methods.
+ * </p>
+ *
+ * @see FDBRecordStoreBase
  */
 @API(API.Status.STABLE)
 public class FDBRecordStore extends FDBStoreBase implements FDBRecordStoreBase<Message> {
@@ -200,8 +225,12 @@ public class FDBRecordStore extends FDBStoreBase implements FDBRecordStoreBase<M
     protected final PipelineSizer pipelineSizer;
 
     @Nullable
+    protected final FDBRecordStoreStateCache storeStateCache;
+
+    @Nullable
     private Subspace cachedRecordsSubspace;
 
+    @Nonnull
     private final Cache<Tuple, FDBRawRecord> preloadCache;
 
     @SuppressWarnings("squid:S00107")
@@ -212,7 +241,8 @@ public class FDBRecordStore extends FDBStoreBase implements FDBRecordStoreBase<M
                              @Nonnull RecordSerializer<Message> serializer,
                              @Nonnull IndexMaintainerRegistry indexMaintainerRegistry,
                              @Nonnull IndexMaintenanceFilter indexMaintenanceFilter,
-                             @Nonnull PipelineSizer pipelineSizer) {
+                             @Nonnull PipelineSizer pipelineSizer,
+                             @Nullable FDBRecordStoreStateCache storeStateCache) {
         super(context, subspaceProvider);
         this.formatVersion = formatVersion;
         this.metaDataProvider = metaDataProvider;
@@ -220,9 +250,9 @@ public class FDBRecordStore extends FDBStoreBase implements FDBRecordStoreBase<M
         this.indexMaintainerRegistry = indexMaintainerRegistry;
         this.indexMaintenanceFilter = indexMaintenanceFilter;
         this.pipelineSizer = pipelineSizer;
-
+        this.storeStateCache = storeStateCache;
         this.omitUnsplitRecordSuffix = formatVersion < SAVE_UNSPLIT_WITH_SUFFIX_FORMAT_VERSION;
-        this.preloadCache = CacheBuilder.<Tuple,FDBRawRecord>newBuilder().maximumSize(PRELOAD_CACHE_SIZE).build();
+        this.preloadCache = CacheBuilder.newBuilder().maximumSize(PRELOAD_CACHE_SIZE).build();
     }
 
     @Override
@@ -230,7 +260,7 @@ public class FDBRecordStore extends FDBStoreBase implements FDBRecordStoreBase<M
         return this;
     }
 
-    @Nullable
+    @Nonnull
     @Override
     public FDBRecordContext getContext() {
         return context;
@@ -296,7 +326,7 @@ public class FDBRecordStore extends FDBStoreBase implements FDBRecordStoreBase<M
     public RecordStoreState getRecordStoreState() {
         if (recordStoreState == null) {
             recordStoreState = context.asyncToSync(FDBStoreTimer.Waits.WAIT_LOAD_RECORD_STORE_STATE,
-                    preloadSubspaceAsync().thenCompose(vignore -> loadRecordStoreStateAsync(context, getSubspace())));
+                    preloadSubspaceAsync().thenCompose(vignore -> loadRecordStoreStateAsync(StoreExistenceCheck.NONE).thenApply(RecordStoreState::toMutable)));
         }
         return recordStoreState;
     }
@@ -422,6 +452,7 @@ public class FDBRecordStore extends FDBStoreBase implements FDBRecordStoreBase<M
         final byte[] serialized = typedSerializer.serialize(metaData, recordBuilder.getRecordType(), recordBuilder.getRecord(), getTimer());
         final FDBRecordVersion splitVersion = useOldVersionFormat() ? null : version;
         final SplitHelper.SizeInfo sizeInfo = new SplitHelper.SizeInfo();
+        preloadCache.invalidate(primaryKey); // clear out cache of older value if present
         SplitHelper.saveWithSplit(context, recordsSubspace(), recordBuilder.getPrimaryKey(), serialized, splitVersion, metaData.isSplitLongRecords(), omitUnsplitRecordSuffix, true, oldSizeInfo, sizeInfo);
         countKeysAndValues(FDBStoreTimer.Counts.SAVE_RECORD_KEY, FDBStoreTimer.Counts.SAVE_RECORD_KEY_BYTES, FDBStoreTimer.Counts.SAVE_RECORD_VALUE_BYTES, sizeInfo);
         recordBuilder.setSize(sizeInfo);
@@ -633,7 +664,7 @@ public class FDBRecordStore extends FDBStoreBase implements FDBRecordStoreBase<M
         final CompletableFuture<Void> checker = context.instrument(FDBStoreTimer.Events.CHECK_INDEX_UNIQUENESS,
                 AsyncUtil.forEach(kvs, kv -> {
                     Tuple existingEntry = SplitHelper.unpackKey(indexMaintainer.getIndexSubspace(), kv);
-                    Tuple existingKey = FDBRecordStoreBase.indexEntryPrimaryKey(index, existingEntry);
+                    Tuple existingKey = index.getEntryPrimaryKey(existingEntry);
                     if (!TupleHelpers.equals(primaryKey, existingKey)) {
                         if (isIndexWriteOnly(index)) {
                             Tuple valueKey = indexEntry.getKey();
@@ -688,18 +719,14 @@ public class FDBRecordStore extends FDBStoreBase implements FDBRecordStoreBase<M
         }
 
         final SplitHelper.SizeInfo sizeInfo = new SplitHelper.SizeInfo();
-        final long startTime = System.nanoTime();
         CompletableFuture<FDBStoredRecord<M>> result = loadRawRecordAsync(primaryKey, sizeInfo, snapshot)
                 .thenCompose(rawRecord -> {
                     final ByteScanLimiter byteScanLimiter = executeState.getByteScanLimiter();
                     if (byteScanLimiter != null) {
                         byteScanLimiter.registerScannedBytes(sizeInfo.getKeySize() + sizeInfo.getValueSize());
                     }
-                    final long startTimeToDeserialize = System.nanoTime();
-                    final long timeToLoad = startTimeToDeserialize - startTime;
                     return rawRecord == null ? CompletableFuture.completedFuture(null) :
-                            deserializeRecord(typedSerializer, rawRecord, metaData, versionFutureOptional)
-                                    .thenApply(storedRecord -> storedRecord.setTimeToLoad(timeToLoad).setTimeToDeserialize(System.nanoTime() - startTimeToDeserialize).build());
+                            deserializeRecord(typedSerializer, rawRecord, metaData, versionFutureOptional);
                 });
         return context.instrument(FDBStoreTimer.Events.LOAD_RECORD, result);
     }
@@ -780,11 +807,9 @@ public class FDBRecordStore extends FDBStoreBase implements FDBRecordStoreBase<M
         return loadRecordVersionAsync(primaryKey, snapshot).map(future -> context.asyncToSync(FDBStoreTimer.Waits.WAIT_LOAD_RECORD_VERSION, future));
     }
 
-    // This only needs to return the builder instead of the built record to support the temporary timing fields.
-    // TODO: Simplify after that is removed.
-    private <M extends Message> CompletableFuture<FDBStoredRecordBuilder<M>> deserializeRecord(@Nonnull RecordSerializer<M> typedSerializer, @Nonnull final FDBRawRecord rawRecord,
-                                                                                               @Nonnull final RecordMetaData metaData,
-                                                                                               @Nonnull final Optional<CompletableFuture<FDBRecordVersion>> versionFutureOptional) {
+    private <M extends Message> CompletableFuture<FDBStoredRecord<M>> deserializeRecord(@Nonnull RecordSerializer<M> typedSerializer, @Nonnull final FDBRawRecord rawRecord,
+                                                                                        @Nonnull final RecordMetaData metaData,
+                                                                                        @Nonnull final Optional<CompletableFuture<FDBRecordVersion>> versionFutureOptional) {
         final Tuple primaryKey = rawRecord.getPrimaryKey();
         final byte[] serialized = rawRecord.getRawRecord();
 
@@ -801,20 +826,23 @@ public class FDBRecordStore extends FDBStoreBase implements FDBRecordStoreBase<M
                 // In the current format version, the version should be read along with the version,
                 // so this should be hit the majority of the time.
                 recordBuilder.setVersion(rawRecord.getVersion());
-                return CompletableFuture.completedFuture(recordBuilder);
+                return CompletableFuture.completedFuture(recordBuilder.build());
             } else if (versionFutureOptional.isPresent()) {
                 // In an old format version, the record version was stored separately and requires
                 // another read (which has hopefully happened in parallel with the main record read in the background).
-                return versionFutureOptional.get().thenApply(recordBuilder::setVersion);
+                return versionFutureOptional.get().thenApply(version -> {
+                    recordBuilder.setVersion(version);
+                    return recordBuilder.build();
+                });
             } else {
                 // Look for the version in the various places that it might be. If we can't find it, then
                 // this will return an FDBStoredRecord where the version is unset.
-                return CompletableFuture.completedFuture(recordBuilder);
+                return CompletableFuture.completedFuture(recordBuilder.build());
             }
         } catch (Exception ex) {
             final LoggableException ex2 = new RecordCoreException("Failed to deserialize record", ex);
             ex2.addLogInfo(
-                    subspaceProvider.logKey(), subspaceProvider,
+                    subspaceProvider.logKey(), subspaceProvider.toString(context),
                     LogMessageKeys.PRIMARY_KEY, primaryKey);
             if (LOGGER.isDebugEnabled()) {
                 ex2.addLogInfo("serialized", ByteArrayUtil2.loggable(serialized),
@@ -858,7 +886,11 @@ public class FDBRecordStore extends FDBStoreBase implements FDBRecordStoreBase<M
     @Override
     @Nonnull
     public CompletableFuture<Void> preloadRecordAsync(@Nonnull final Tuple primaryKey) {
-        return loadRawRecordAsync(primaryKey, null, false).thenAccept(fdbRawRecord -> preloadCache.put(primaryKey, fdbRawRecord));
+        return loadRawRecordAsync(primaryKey, null, false).thenAccept(fdbRawRecord -> {
+            if (fdbRawRecord != null) {
+                preloadCache.put(primaryKey, fdbRawRecord);
+            }
+        });
     }
 
     @Override
@@ -961,8 +993,7 @@ public class FDBRecordStore extends FDBStoreBase implements FDBRecordStoreBase<M
                 // Newer format versions: the version is either in the record or it is not -- do not do another read.
                 versionFutureOptional = Optional.empty();
             }
-            return deserializeRecord(typedSerializer, rawRecord, metaData,
-                    versionFutureOptional).thenApply(FDBStoredRecordBuilder::build);
+            return deserializeRecord(typedSerializer, rawRecord, metaData, versionFutureOptional);
         }, pipelineSizer.getPipelineSize(PipelineOperation.KEY_TO_RECORD));
         return context.instrument(FDBStoreTimer.Events.SCAN_RECORDS, result);
     }
@@ -1016,7 +1047,7 @@ public class FDBRecordStore extends FDBStoreBase implements FDBRecordStoreBase<M
             Tuple valueKey = TupleHelpers.subTuple(entry.getKey(), 0, indexColumns);
             Tuple primaryKey = TupleHelpers.subTuple(entry.getKey(), indexColumns, entry.getKey().size());
             Tuple existingKey = entry.getValue();
-            return new RecordIndexUniquenessViolation(index, new IndexEntry(valueKey, entry.getValue()), primaryKey, existingKey);
+            return new RecordIndexUniquenessViolation(index, new IndexEntry(index, valueKey, entry.getValue()), primaryKey, existingKey);
         });
     }
 
@@ -1082,20 +1113,35 @@ public class FDBRecordStore extends FDBStoreBase implements FDBRecordStoreBase<M
     public static void deleteStore(FDBRecordContext context, Subspace subspace) {
         final Transaction transaction = context.ensureActive();
         transaction.clear(subspace.range());
+        context.setDirtyStoreState(true);
     }
 
     @Override
     public void deleteAllRecords() {
         preloadCache.invalidateAll();
         Transaction tr = ensureContextActive();
-        tr.clear(recordsSubspace().getKey(),
-                 getSubspace().range().end);
+
+        // Clear out all data except for the store header key and the index state space.
+        // Those two subspaces are determined by the configuration of the record store rather then
+        // the records.
+        Range indexStateRange = indexStateSubspace().range();
+        tr.clear(recordsSubspace().getKey(), indexStateRange.begin);
+        tr.clear(indexStateRange.end, getSubspace().range().end);
     }
 
     @Override
     public CompletableFuture<Void> deleteRecordsWhereAsync(@Nonnull QueryComponent component) {
         preloadCache.invalidateAll();
         return new RecordsWhereDeleter(component).run();
+    }
+
+    /**
+     * Returns whether or not record keys contain a trailing suffix indicating whether or not the record has been (or
+     * could have been) split across multiple records.
+     * @return <code>true</code> if the keys have split suffixes, otherwise <code>false</code>.
+     */
+    private boolean hasSplitRecordSuffix() {
+        return getRecordMetaData().isSplitLongRecords() || !omitUnsplitRecordSuffix;
     }
 
     class RecordsWhereDeleter {
@@ -1302,6 +1348,11 @@ public class FDBRecordStore extends FDBStoreBase implements FDBRecordStoreBase<M
         return pipelineSizer;
     }
 
+    @Nonnull
+    private FDBRecordStoreStateCache getStoreStateCache() {
+        return storeStateCache == null ? context.getDatabase().getStoreStateCache() : storeStateCache;
+    }
+
     @Override
     public CompletableFuture<Long> getSnapshotRecordCount(@Nonnull KeyExpression key, @Nonnull Key.Evaluated value) {
         if (getRecordMetaData().getRecordCountKey() != null) {
@@ -1449,80 +1500,51 @@ public class FDBRecordStore extends FDBStoreBase implements FDBRecordStoreBase<M
     @Nonnull
     public CompletableFuture<Boolean> checkVersion(@Nullable UserVersionChecker userVersionChecker,
                                                    @Nonnull StoreExistenceCheck existenceCheck) {
-        CompletableFuture<Void> subspaceFuture = preloadSubspaceAsync();
-        CompletableFuture<KeyValue> firstKeyFuture = subspaceFuture.thenCompose(vignore -> readStoreFirstKey());
-        if (recordStoreState == null) {
-            firstKeyFuture = subspaceFuture.thenCompose(vignore -> preloadRecordStoreStateAsync())
-                    .thenCombine(firstKeyFuture, (v, kv) -> kv);
-        }
-        return checkVersion(firstKeyFuture, userVersionChecker, existenceCheck);
+        return checkVersion(userVersionChecker, existenceCheck, AsyncUtil.DONE);
     }
 
     @Nonnull
-    protected CompletableFuture<Boolean> checkVersion(@Nonnull CompletableFuture<KeyValue> firstKeyFuture,
-                                                      @Nullable UserVersionChecker userVersionChecker,
-                                                      @Nonnull StoreExistenceCheck existenceCheck) {
-        CompletableFuture<Boolean> result = firstKeyFuture.thenCompose(keyValue -> {
-            RecordMetaDataProto.DataStoreInfo.Builder info = RecordMetaDataProto.DataStoreInfo.newBuilder();
-            final int oldMetaDataVersion;
-            final int oldUserVersion;
-            if (keyValue == null) {
-                if (existenceCheck == StoreExistenceCheck.ERROR_IF_NOT_EXISTS) {
-                    throw new RecordStoreDoesNotExistException("Record store does not exist",
-                            subspaceProvider.logKey(), subspaceProvider);
-                }
-                oldMetaDataVersion = oldUserVersion = -1;
-                if (getTimer() != null) {
-                    getTimer().increment(FDBStoreTimer.Counts.CREATE_RECORD_STORE);
-                }
-            } else if (existenceCheck == StoreExistenceCheck.ERROR_IF_EXISTS) {
-                throw new RecordStoreAlreadyExistsException("Record store already exists",
-                        subspaceProvider.logKey(), subspaceProvider);
-            } else if (!getSubspace().unpack(keyValue.getKey()).equals(Tuple.from(STORE_INFO_KEY))) {
-                if (existenceCheck != StoreExistenceCheck.NONE) {
-                    throw new RecordStoreNoInfoAndNotEmptyException("Record store has no info but is not empty",
-                            subspaceProvider.logKey(), subspaceProvider,
-                            LogMessageKeys.KEY, getSubspace().unpack(keyValue.getKey()));
-                } else {
-                    LOGGER.warn(KeyValueLogMessage.of("Record store has no info but is not empty",
-                            subspaceProvider.logKey(), subspaceProvider,
-                            LogMessageKeys.KEY, getSubspace().unpack(keyValue.getKey())));
-                    // Treat as brand new, although there is no way to be sure that what was written is compatible
-                    // with the current default versions.
-                    oldMetaDataVersion = oldUserVersion = -1;
-                }
-            } else {
-                try {
-                    info.mergeFrom(keyValue.getValue());
-                } catch (InvalidProtocolBufferException ex) {
-                    throw new RecordCoreStorageException("Error reading version", ex);
-                }
-                if (info.getFormatVersion() < MIN_FORMAT_VERSION || info.getFormatVersion() > MAX_SUPPORTED_FORMAT_VERSION) {
-                    throw new UnsupportedFormatVersionException("Unsupported format version " + info.getFormatVersion(),
-                            subspaceProvider.logKey(), subspaceProvider);
-                }
-                oldMetaDataVersion = info.getMetaDataversion();
-                oldUserVersion = info.getUserVersion();
-            }
-            if (info.hasFormatVersion() && info.getFormatVersion() >= SAVE_UNSPLIT_WITH_SUFFIX_FORMAT_VERSION) {
-                // If the store is already using a format version greater than or equal to the version
-                // where the unsplit records are now written with an extra suffix, use the value for
-                // that stored from the database. (Note that this depends on the property that calling "get"
-                // on an unset boolean field results in getting back "false".)
-                omitUnsplitRecordSuffix = info.getOmitUnsplitRecordSuffix();
-            }
-            final boolean[] dirty = new boolean[1];
-            final CompletableFuture<Void> checkedUserVersion = checkUserVersion(userVersionChecker, oldUserVersion, oldMetaDataVersion, info, dirty);
-            final CompletableFuture<Void> checkedRebuild = checkedUserVersion.thenCompose(vignore -> checkPossiblyRebuild(userVersionChecker, info, dirty));
-            return checkedRebuild.thenApply(vignore -> {
-                if (dirty[0]) {
-                    info.setLastUpdateTime(System.currentTimeMillis());
-                    ensureContextActive().set(getSubspace().pack(STORE_INFO_KEY), info.build().toByteArray());
-                }
-                return dirty[0];
-            });
+    private CompletableFuture<Boolean> checkVersion(@Nullable UserVersionChecker userVersionChecker,
+                                                    @Nonnull StoreExistenceCheck existenceCheck,
+                                                    @Nonnull CompletableFuture<Void> metaDataPreloadFuture) {
+        CompletableFuture<Void> subspacePreloadFuture = preloadSubspaceAsync();
+        CompletableFuture<RecordMetaDataProto.DataStoreInfo> storeHeaderFuture = getStoreStateCache().get(this, existenceCheck).thenApply(storeInfo -> {
+            recordStoreState = storeInfo.getRecordStoreState().toMutable();
+            return recordStoreState.getStoreHeader();
         });
+        if (!MoreAsyncUtil.isCompletedNormally(metaDataPreloadFuture)) {
+            storeHeaderFuture = metaDataPreloadFuture.thenCombine(storeHeaderFuture, (vignore, storeHeader) -> storeHeader);
+        }
+        if (!MoreAsyncUtil.isCompletedNormally(subspacePreloadFuture)) {
+            storeHeaderFuture = subspacePreloadFuture.thenCombine(storeHeaderFuture, (vignore, storeHeader) -> storeHeader);
+        }
+        CompletableFuture<Boolean> result = storeHeaderFuture.thenCompose(storeHeader -> checkVersion(storeHeader, userVersionChecker));
         return context.instrument(FDBStoreTimer.Events.CHECK_VERSION, result);
+    }
+
+    @Nonnull
+    private CompletableFuture<Boolean> checkVersion(@Nonnull RecordMetaDataProto.DataStoreInfo storeHeader, @Nullable UserVersionChecker userVersionChecker) {
+        RecordMetaDataProto.DataStoreInfo.Builder info = storeHeader.toBuilder();
+        final boolean newStore = info.getFormatVersion() == 0;
+        final int oldMetaDataVersion = newStore ? -1 : info.getMetaDataversion();
+        final int oldUserVersion = newStore ? -1 : info.getUserVersion();
+        if (info.hasFormatVersion() && info.getFormatVersion() >= SAVE_UNSPLIT_WITH_SUFFIX_FORMAT_VERSION) {
+            // If the store is already using a format version greater than or equal to the version
+            // where the unsplit records are now written with an extra suffix, use the value for
+            // that stored from the database. (Note that this depends on the property that calling "get"
+            // on an unset boolean field results in getting back "false".)
+            omitUnsplitRecordSuffix = info.getOmitUnsplitRecordSuffix();
+        }
+        final boolean[] dirty = new boolean[1];
+        final CompletableFuture<Void> checkedUserVersion = checkUserVersion(userVersionChecker, oldUserVersion, oldMetaDataVersion, info, dirty);
+        final CompletableFuture<Void> checkedRebuild = checkedUserVersion.thenCompose(vignore -> checkPossiblyRebuild(userVersionChecker, info, dirty));
+        return checkedRebuild.thenApply(vignore -> {
+            if (dirty[0]) {
+                info.setLastUpdateTime(System.currentTimeMillis());
+                saveStoreHeader(info.build());
+            }
+            return dirty[0];
+        });
     }
 
     private CompletableFuture<Void> checkUserVersion(@Nullable UserVersionChecker userVersionChecker, int oldUserVersion, int oldMetaDataVersion,
@@ -1536,9 +1558,9 @@ public class FDBRecordStore extends FDBStoreBase implements FDBRecordStoreBase<M
                     if (newUserVersion != oldUserVersion) {
                         if (oldUserVersion > newUserVersion) {
                             LOGGER.error(KeyValueLogMessage.of("stale user version",
-                                    "storedVersion", oldUserVersion,
-                                    "localVersion", newUserVersion,
-                                    subspaceProvider.logKey(), subspaceProvider));
+                                            LogMessageKeys.STORED_VERSION, oldUserVersion,
+                                            LogMessageKeys.LOCAL_VERSION, newUserVersion,
+                                            subspaceProvider.logKey(), subspaceProvider.toString(context)));
                             throw new RecordStoreStaleUserVersionException("Stale user version with local version " + newUserVersion + " and stored version " + oldUserVersion);
                         }
                         info.setUserVersion(newUserVersion);
@@ -1547,13 +1569,13 @@ public class FDBRecordStore extends FDBStoreBase implements FDBRecordStoreBase<M
                             if (LOGGER.isDebugEnabled()) {
                                 LOGGER.debug(KeyValueLogMessage.of("setting initial user version",
                                         LogMessageKeys.NEW_VERSION, newUserVersion,
-                                        subspaceProvider.logKey(), subspaceProvider));
+                                        subspaceProvider.logKey(), subspaceProvider.toString(context)));
                             }
                         } else {
                             LOGGER.info(KeyValueLogMessage.of("changing user version",
                                     LogMessageKeys.OLD_VERSION, oldUserVersion,
                                     LogMessageKeys.NEW_VERSION, newUserVersion,
-                                    subspaceProvider.logKey(), subspaceProvider));
+                                    subspaceProvider.logKey(), subspaceProvider.toString(context)));
                         }
                     }
                     return null;
@@ -1561,20 +1583,143 @@ public class FDBRecordStore extends FDBStoreBase implements FDBRecordStoreBase<M
     }
 
     @Nonnull
+    private RecordMetaDataProto.DataStoreInfo checkAndParseStoreHeader(@Nullable KeyValue firstKeyValue,
+                                                                       @Nonnull StoreExistenceCheck existenceCheck) {
+        RecordMetaDataProto.DataStoreInfo info;
+        if (firstKeyValue == null) {
+            info = RecordMetaDataProto.DataStoreInfo.getDefaultInstance();
+        } else if (!checkFirstKeyIsHeader(firstKeyValue, getContext(), getSubspaceProvider(), getSubspace(), existenceCheck)) {
+            // Treat as brand new, although there is no way to be sure that what was written is compatible
+            // with the current default versions.
+            info = RecordMetaDataProto.DataStoreInfo.getDefaultInstance();
+        } else {
+            try {
+                info = RecordMetaDataProto.DataStoreInfo.parseFrom(firstKeyValue.getValue());
+            } catch (InvalidProtocolBufferException ex) {
+                throw new RecordCoreStorageException("Error reading version", ex);
+            }
+        }
+        checkStoreHeaderInternal(info, getContext(), getSubspaceProvider(), existenceCheck);
+        return info;
+    }
+
     @API(API.Status.INTERNAL)
-    protected CompletableFuture<KeyValue> readStoreFirstKey() {
-        final AsyncIterator<KeyValue> iterator = context.ensureActive().getRange(getSubspace().range(), 1).iterator();
+    @Nonnull
+    public static CompletableFuture<Void> checkStoreHeader(@Nonnull RecordMetaDataProto.DataStoreInfo storeHeader,
+                                                           @Nonnull FDBRecordContext context,
+                                                           @Nonnull SubspaceProvider subspaceProvider,
+                                                           @Nonnull Subspace subspace,
+                                                           @Nonnull StoreExistenceCheck existenceCheck) {
+        if (storeHeader == RecordMetaDataProto.DataStoreInfo.getDefaultInstance()) {
+            // Validate that the store is empty
+            return readStoreFirstKey(context, subspace, IsolationLevel.SNAPSHOT).thenAccept(firstKeyValue -> {
+                if (firstKeyValue != null && checkFirstKeyIsHeader(firstKeyValue, context, subspaceProvider, subspace, existenceCheck)) {
+                    // Somehow, we had a default store header, which indicates that this was an uninitialized store,
+                    // but when we read the first key, it was a store header.
+                    throw new RecordCoreException("Record store with no header had header in database",
+                            subspaceProvider.logKey(), subspaceProvider.toString(context));
+                }
+                // We have relied on the value of the store header key itself. We performed the read at SNAPSHOT,
+                // though, to avoid conflicts on the first key if the store isn't empty.
+                context.ensureActive().addReadConflictKey(subspace.pack(STORE_INFO_KEY));
+                checkStoreHeaderInternal(storeHeader, context, subspaceProvider, existenceCheck);
+            });
+        } else {
+            try {
+                checkStoreHeaderInternal(storeHeader, context, subspaceProvider, existenceCheck);
+                return AsyncUtil.DONE;
+            } catch (RecordCoreException e) {
+                CompletableFuture<Void> future = new CompletableFuture<>();
+                future.completeExceptionally(e);
+                return future;
+            }
+        }
+    }
+
+    private static boolean checkFirstKeyIsHeader(@Nonnull KeyValue firstKeyValue,
+                                                 @Nonnull FDBRecordContext context,
+                                                 @Nonnull SubspaceProvider subspaceProvider,
+                                                 @Nonnull Subspace subspace,
+                                                 @Nonnull StoreExistenceCheck existenceCheck) {
+        if (TupleHelpers.equals(subspace.unpack(firstKeyValue.getKey()), Tuple.from(STORE_INFO_KEY))) {
+            return true;
+        } else if (existenceCheck == StoreExistenceCheck.NONE) {
+            LOGGER.warn(KeyValueLogMessage.of("Record store has no info but is not empty",
+                    subspaceProvider.logKey(), subspaceProvider.toString(context),
+                    LogMessageKeys.KEY, subspace.unpack(firstKeyValue.getKey())));
+            return false;
+        } else {
+            throw new RecordStoreNoInfoAndNotEmptyException("Record store has no info but is not empty",
+                    subspaceProvider.logKey(), subspaceProvider.toString(context),
+                    LogMessageKeys.KEY, subspace.unpack(firstKeyValue.getKey()));
+        }
+    }
+
+    private static void checkStoreHeaderInternal(@Nonnull RecordMetaDataProto.DataStoreInfo storeHeader,
+                                                 @Nonnull FDBRecordContext context,
+                                                 @Nonnull SubspaceProvider subspaceProvider,
+                                                 @Nonnull StoreExistenceCheck existenceCheck) {
+        if (storeHeader == RecordMetaDataProto.DataStoreInfo.getDefaultInstance()) {
+            if (existenceCheck == StoreExistenceCheck.ERROR_IF_NOT_EXISTS) {
+                throw new RecordStoreDoesNotExistException("Record store does not exist",
+                        subspaceProvider.logKey(), subspaceProvider.toString(context));
+            }
+            context.increment(FDBStoreTimer.Counts.CREATE_RECORD_STORE);
+        } else if (existenceCheck == StoreExistenceCheck.ERROR_IF_EXISTS) {
+            throw new RecordStoreAlreadyExistsException("Record store already exists",
+                    subspaceProvider.logKey(), subspaceProvider.toString(context));
+        } else {
+            if (storeHeader.getFormatVersion() < MIN_FORMAT_VERSION || storeHeader.getFormatVersion() > MAX_SUPPORTED_FORMAT_VERSION) {
+                throw new UnsupportedFormatVersionException("Unsupported format version " + storeHeader.getFormatVersion(),
+                        subspaceProvider.logKey(), subspaceProvider);
+            }
+        }
+    }
+
+    @Nonnull
+    private CompletableFuture<RecordMetaDataProto.DataStoreInfo> loadStoreHeaderAsync(@Nonnull StoreExistenceCheck existenceCheck, @Nonnull IsolationLevel isolationLevel) {
+        return readStoreFirstKey(context, getSubspace(), isolationLevel).thenApply(keyValue -> checkAndParseStoreHeader(keyValue, existenceCheck));
+    }
+
+    private void saveStoreHeader(@Nonnull RecordMetaDataProto.DataStoreInfo storeHeader) {
+        if (recordStoreState == null) {
+            throw new RecordCoreException("cannot update store header with a null record store state");
+        }
+        recordStoreState.beginWrite();
+        try {
+            context.setDirtyStoreState(true);
+            synchronized (recordStoreState) {
+                recordStoreState.setStoreHeader(storeHeader);
+                ensureContextActive().set(getSubspace().pack(STORE_INFO_KEY), storeHeader.toByteArray());
+            }
+        } finally {
+            recordStoreState.endWrite();
+        }
+    }
+
+    @Nonnull
+    private static CompletableFuture<KeyValue> readStoreFirstKey(@Nonnull FDBRecordContext context, @Nonnull Subspace subspace, @Nonnull IsolationLevel isolationLevel) {
+        final AsyncIterator<KeyValue> iterator = context.readTransaction(isolationLevel.isSnapshot()).getRange(subspace.range(), 1).iterator();
         return context.instrument(FDBStoreTimer.Events.LOAD_RECORD_STORE_INFO,
                 iterator.onHasNext().thenApply(hasNext -> hasNext ? iterator.next() : null));
     }
 
+    /**
+     * Rebuild all of this store's indexes. All indexes will then be marked as {@linkplain IndexState#READABLE readable}
+     * when this function completes. Note that this will attempt to read all of the records within
+     * this store in a single transaction, so for large record stores, this can run up against transaction
+     * time and size limits. For larger stores, one should use the {@link OnlineIndexer} to build
+     * each index instead.
+     *
+     * @return a future that will complete when all of the indexes are built
+     */
     @Nonnull
     public CompletableFuture<Void> rebuildAllIndexes() {
         Transaction tr = ensureContextActive();
+        // Note that index states are *not* cleared, as rebuilding the indexes resets each state
         tr.clear(getSubspace().range(Tuple.from(INDEX_KEY)));
         tr.clear(getSubspace().range(Tuple.from(INDEX_SECONDARY_SPACE_KEY)));
         tr.clear(getSubspace().range(Tuple.from(INDEX_RANGE_SPACE_KEY)));
-        tr.clear(getSubspace().range(Tuple.from(INDEX_STATE_SPACE_KEY)));
         tr.clear(getSubspace().range(Tuple.from(INDEX_UNIQUENESS_VIOLATIONS_KEY)));
         List<CompletableFuture<Void>> work = new LinkedList<>();
         addRebuildRecordCountsJob(work);
@@ -1599,6 +1744,25 @@ public class FDBRecordStore extends FDBStoreBase implements FDBRecordStoreBase<M
         });
     }
 
+    // Actually (1) writes the index state to the database and (2) updates the cached state with the new state
+    private void updateIndexState(@Nonnull String indexName, byte[] indexKey, @Nonnull IndexState indexState) {
+        // This is generally called by someone who should already have a write lock, but adding them here
+        // defensively shouldn't cause problems.
+        recordStoreState.beginWrite();
+        try {
+            context.setDirtyStoreState(true);
+            Transaction tr = context.ensureActive();
+            if (IndexState.READABLE.equals(indexState)) {
+                tr.clear(indexKey);
+            } else {
+                tr.set(indexKey, Tuple.from(indexState.code()).pack());
+            }
+            recordStoreState.setState(indexName, indexState);
+        } finally {
+            recordStoreState.endWrite();
+        }
+    }
+
     @Nonnull
     private CompletableFuture<Boolean> markIndexNotReadable(@Nonnull String indexName, @Nonnull IndexState indexState) {
         if (recordStoreState == null) {
@@ -1616,8 +1780,7 @@ public class FDBRecordStore extends FDBStoreBase implements FDBRecordStoreBase<M
             Transaction tr = context.ensureActive();
             CompletableFuture<Boolean> future = tr.get(indexKey).thenApply(previous -> {
                 if (previous == null || !Tuple.fromBytes(previous).get(0).equals(indexState.code())) {
-                    tr.set(indexKey, Tuple.from(indexState.code()).pack());
-                    recordStoreState.setState(indexName, indexState);
+                    updateIndexState(indexName, indexKey, indexState);
                     return true;
                 } else {
                     return false;
@@ -1793,17 +1956,17 @@ public class FDBRecordStore extends FDBStoreBase implements FDBRecordStoreBase<M
                                     LogMessageKeys.INDEX_NAME, index.getName(),
                                     "unbuiltRangeBegin", ByteArrayUtil2.loggable(firstUnbuilt.get().begin),
                                     "unbuiltRangeEnd", ByteArrayUtil2.loggable(firstUnbuilt.get().end),
-                                    subspaceProvider.logKey(), subspaceProvider);
+                                    subspaceProvider.logKey(), subspaceProvider.toString(context),
+                                    LogMessageKeys.SUBSPACE_KEY, index.getSubspaceKey());
                         } else if (uniquenessViolation.isPresent()) {
                             RecordIndexUniquenessViolation wrapped = new RecordIndexUniquenessViolation("Uniqueness violation when making index readable",
                                                                                                         uniquenessViolation.get());
                             wrapped.addLogInfo(
                                     LogMessageKeys.INDEX_NAME, index.getName(),
-                                    subspaceProvider.logKey(), subspaceProvider);
+                                    subspaceProvider.logKey(), subspaceProvider.toString(context));
                             throw wrapped;
                         } else {
-                            tr.clear(indexKey);
-                            recordStoreState.setState(index.getName(), IndexState.READABLE);
+                            updateIndexState(index.getName(), indexKey, IndexState.READABLE);
                             return true;
                         }
                     });
@@ -1865,8 +2028,7 @@ public class FDBRecordStore extends FDBStoreBase implements FDBRecordStoreBase<M
             byte[] indexKey = indexStateSubspace().pack(indexName);
             CompletableFuture<Boolean> future = tr.get(indexKey).thenApply(previous -> {
                 if (previous != null) {
-                    tr.clear(indexKey);
-                    recordStoreState.setState(indexName, IndexState.READABLE);
+                    updateIndexState(indexName, indexKey, IndexState.READABLE);
                     return true;
                 } else {
                     return false;
@@ -1888,7 +2050,7 @@ public class FDBRecordStore extends FDBStoreBase implements FDBRecordStoreBase<M
     @Nonnull
     @API(API.Status.INTERNAL)
     protected CompletableFuture<Void> preloadSubspaceAsync() {
-        return subspaceProvider.getSubspaceAsync().thenApply(subspace -> null);
+        return getSubspaceAsync().thenApply(subspace -> null);
     }
 
     /**
@@ -1898,52 +2060,52 @@ public class FDBRecordStore extends FDBStoreBase implements FDBRecordStoreBase<M
     @Nonnull
     @API(API.Status.INTERNAL)
     protected CompletableFuture<Void> preloadRecordStoreStateAsync() {
-        return loadRecordStoreStateAsync(context, getSubspace()).thenAccept(state -> this.recordStoreState = state);
+        return loadRecordStoreStateAsync(StoreExistenceCheck.NONE, IsolationLevel.SNAPSHOT, IsolationLevel.SNAPSHOT)
+                .thenAccept(state -> this.recordStoreState = state.toMutable());
     }
 
     /**
      * Loads the current state of the record store within the given subspace asynchronously.
-     * This behaves exactly like the three-parameter version of
-     * {@link #loadRecordStoreStateAsync(FDBRecordContext, Subspace, IsolationLevel) loadRecordStoreStateAsync()},
-     * but this fixes the {@link IsolationLevel} to {@link IsolationLevel#SNAPSHOT SNAPSHOT}. This is
-     * because most operations will not depend on the entirety of the record store state but instead
-     * only on the state of the indexes used. For this reason, to decrease conflicts, in the normal
-     * case, the record store state should be loaded with the <code>SNAPSHOT</code> isolation level and
-     * then consistency is maintained by only adding read conflicts for indexes whose state is actually
-     * used.
      *
-     * @param context the record context in which the retrieve the record store state
-     * @param subspace the subspace of the record store
+     * @param existenceCheck the action to be taken when the record store already exists (or does not exist yet)
      * @return a future that will contain the state of the record state located at the given subspace
      */
+    @API(API.Status.INTERNAL)
     @Nonnull
-    public static CompletableFuture<MutableRecordStoreState> loadRecordStoreStateAsync(@Nonnull FDBRecordContext context,
-                                                                                       @Nonnull Subspace subspace) {
-        return loadRecordStoreStateAsync(context, subspace, IsolationLevel.SNAPSHOT);
+    public CompletableFuture<RecordStoreState> loadRecordStoreStateAsync(@Nonnull StoreExistenceCheck existenceCheck) {
+        return loadRecordStoreStateAsync(existenceCheck, IsolationLevel.SERIALIZABLE, IsolationLevel.SNAPSHOT);
     }
 
-    /**
-     * Loads the current state of the record store within the given subspace asynchronously.
-     * This method is static so that one can load the record store state before instantiating
-     * the instance. This method is called for the user by the various static <code>open</code> methods.
-     * @param context the record context in which to retrieve the record store state
-     * @param subspace the subspace of the record store
-     * @param isolationLevel the isolation level to use when reading
-     * @return a future that will contain the state of the record store located at the given subspace
-     */
     @Nonnull
-    public static CompletableFuture<MutableRecordStoreState> loadRecordStoreStateAsync(@Nonnull FDBRecordContext context,
-                                                                                       @Nonnull Subspace subspace,
-                                                                                       @Nonnull IsolationLevel isolationLevel) {
-        Subspace isSubspace = subspace.subspace(Tuple.from(INDEX_STATE_SPACE_KEY));
+    private CompletableFuture<RecordStoreState> loadRecordStoreStateAsync(@Nonnull StoreExistenceCheck existenceCheck,
+                                                                          @Nonnull IsolationLevel storeHeaderIsolationLevel,
+                                                                          @Nonnull IsolationLevel indexStateIsolationLevel) {
+        // Don't rely on the subspace being loaded as this is called as part of store initialization
+        return getSubspaceAsync().thenCompose(subspace ->
+                loadRecordStoreStateInternalAsync(existenceCheck, storeHeaderIsolationLevel, indexStateIsolationLevel)
+        );
+    }
+
+    @Nonnull
+    private CompletableFuture<RecordStoreState> loadRecordStoreStateInternalAsync(@Nonnull StoreExistenceCheck existenceCheck,
+                                                                                  @Nonnull IsolationLevel storeHeaderIsolationLevel,
+                                                                                  @Nonnull IsolationLevel indexStateIsolationLevel) {
+        CompletableFuture<RecordMetaDataProto.DataStoreInfo> storeHeaderFuture = loadStoreHeaderAsync(existenceCheck, storeHeaderIsolationLevel);
+        CompletableFuture<Map<String, IndexState>> loadIndexStates = loadIndexStatesAsync(indexStateIsolationLevel);
+        return context.instrument(FDBStoreTimer.Events.LOAD_RECORD_STORE_STATE, storeHeaderFuture.thenCombine(loadIndexStates, RecordStoreState::new));
+    }
+
+    @Nonnull
+    private CompletableFuture<Map<String, IndexState>> loadIndexStatesAsync(@Nonnull IsolationLevel isolationLevel) {
+        Subspace isSubspace = getSubspace().subspace(Tuple.from(INDEX_STATE_SPACE_KEY));
         KeyValueCursor cursor = KeyValueCursor.Builder.withSubspace(isSubspace)
-                .setContext(context)
+                .setContext(getContext())
                 .setRange(TupleRange.ALL)
                 .setContinuation(null)
                 .setScanProperties(new ScanProperties(ExecuteProperties.newBuilder().setIsolationLevel(isolationLevel).build()))
                 .build();
-        FDBStoreTimer timer = context.getTimer();
-        CompletableFuture<MutableRecordStoreState> result = cursor.asList().thenApply(list -> {
+        FDBStoreTimer timer = getTimer();
+        CompletableFuture<Map<String, IndexState>> result = cursor.asList().thenApply(list -> {
             Map<String, IndexState> indexStateMap;
             if (list.isEmpty()) {
                 indexStateMap = Collections.emptyMap();
@@ -1963,16 +2125,27 @@ public class FDBRecordStore extends FDBStoreBase implements FDBRecordStoreBase<M
 
                 indexStateMap = indexStateMapBuilder.build();
             }
-            return new MutableRecordStoreState(indexStateMap);
+            return indexStateMap;
         });
         if (timer != null) {
-            result = timer.instrument(FDBStoreTimer.Events.LOAD_RECORD_STORE_STATE, result, context.getExecutor());
+            result = timer.instrument(FDBStoreTimer.Events.LOAD_RECORD_STORE_INDEX_META_DATA, result, context.getExecutor());
         }
         return result;
     }
 
-    // add a read conflict key so that the transaction will fail if the index
-    // state has changed
+    /**
+     * Add a read conflict key for all records.
+     */
+    private void addRecordsReadConflict() {
+        Transaction tr = ensureContextActive();
+        byte[] recordKey = getSubspace().pack(Tuple.from(RECORD_KEY));
+        tr.addReadConflictRange(recordKey, ByteArrayUtil.strinc(recordKey));
+    }
+
+    /**
+     * Add a read conflict key so that the transaction will fail if the index state has changed.
+     * @param indexName the index to conflict on, if it's state changes
+     */
     private void addIndexStateReadConflict(@Nonnull String indexName) {
         if (!getRecordMetaData().hasIndex(indexName)) {
             throw new MetaDataException("Index " + indexName + " does not exist in meta-data.");
@@ -1980,6 +2153,15 @@ public class FDBRecordStore extends FDBStoreBase implements FDBRecordStoreBase<M
         Transaction tr = ensureContextActive();
         byte[] indexStateKey = getSubspace().pack(Tuple.from(INDEX_STATE_SPACE_KEY, indexName));
         tr.addReadConflictKey(indexStateKey);
+    }
+
+    /**
+     * Add a read conflict key for the whole record store state.
+     */
+    private void addStoreStateReadConflict() {
+        Transaction tr = ensureContextActive();
+        byte[] indexStateKey = getSubspace().pack(Tuple.from(INDEX_STATE_SPACE_KEY));
+        tr.addReadConflictRange(indexStateKey, ByteArrayUtil.strinc(indexStateKey));
     }
 
     private boolean checkIndexState(@Nonnull String indexName, @Nonnull IndexState indexState) {
@@ -2158,6 +2340,27 @@ public class FDBRecordStore extends FDBStoreBase implements FDBRecordStoreBase<M
         return sanitizeIndexes(getRecordMetaData().getUniversalIndexes(), index -> !isIndexDisabled(index));
     }
 
+    /**
+     * Gets a map from {@link Index} to {@link IndexState} for all the indexes in the meta-data.
+     * This method will not perform any queries to the underlying database and instead satisfies the answer based on the
+     * in-memory cache of store state. However, if another operation in a different transaction
+     * happens concurrently that changes the index's state, operations using the same {@link FDBRecordContext}
+     * as this record store will fail to commit due to conflicts.
+     * @return a map of all the index states.
+     */
+    @Nonnull
+    public Map<Index, IndexState> getAllIndexStates() {
+        final RecordStoreState localRecordStoreState = getRecordStoreState();
+        localRecordStoreState.beginRead();
+        try {
+            addStoreStateReadConflict();
+            return getRecordMetaData().getAllIndexes().stream()
+                    .collect(Collectors.toMap(Function.identity(), localRecordStoreState::getState));
+        } finally {
+            localRecordStoreState.endRead();
+        }
+    }
+
     @Nonnull
     protected CompletableFuture<Void> rebuildIndexes(@Nonnull Map<Index, List<RecordType>> indexes, @Nonnull Map<Index, IndexState> newStates,
                                                      @Nonnull List<CompletableFuture<Void>> work, @Nonnull RebuildIndexReason reason,
@@ -2228,11 +2431,11 @@ public class FDBRecordStore extends FDBStoreBase implements FDBRecordStoreBase<M
         final boolean newStore = reason == RebuildIndexReason.NEW_STORE;
         if (newStore ? LOGGER.isDebugEnabled() : LOGGER.isInfoEnabled()) {
             final KeyValueLogMessage msg = KeyValueLogMessage.build("rebuilding index with no record",
-                    LogMessageKeys.INDEX_NAME, index.getName(),
-                    "indexVersion", index.getLastModifiedVersion(),
-                    "reason", reason.name(),
-                    subspaceProvider.logKey(), subspaceProvider,
-                    LogMessageKeys.SUBSPACE_KEY, index.getSubspaceKey());
+                                            LogMessageKeys.INDEX_NAME, index.getName(),
+                                            LogMessageKeys.INDEX_VERSION, index.getLastModifiedVersion(),
+                                            LogMessageKeys.REASON, reason.name(),
+                                            subspaceProvider.logKey(), subspaceProvider.toString(context),
+                                            LogMessageKeys.SUBSPACE_KEY, index.getSubspaceKey());
             if (newStore) {
                 LOGGER.debug(msg.toString());
             } else {
@@ -2243,6 +2446,24 @@ public class FDBRecordStore extends FDBStoreBase implements FDBRecordStoreBase<M
         return markIndexReadable(index).thenApply(b -> null);
     }
 
+    /**
+     * Rebuild an index. This clears the index and attempts to build it within a single transaction. Upon
+     * successful completion, the index is marked as {@linkplain IndexState#READABLE readable} and can
+     * be used to satisfy queries.
+     *
+     * <p>
+     * Because the operations all occur within a single transaction, for larger record stores,
+     * this operation can run into transaction size and time limits. (See:
+     * <a href="https://apple.github.io/foundationdb/known-limitations.html">FoundationDB Known Limitations</a>.)
+     * To build an index on such a record store, the user should use the {@link OnlineIndexer}, which
+     * breaks up work across multiple transactions to avoid those limits.
+     * </p>
+     *
+     * @param index the index to rebuild
+     * @return a future that will complete when the index build has finished
+     * @see OnlineIndexer
+     */
+    @Nonnull
     public CompletableFuture<Void> rebuildIndex(@Nonnull Index index) {
         return rebuildIndex(index, getRecordMetaData().recordTypesForIndex(index), RebuildIndexReason.EXPLICIT);
     }
@@ -2253,11 +2474,11 @@ public class FDBRecordStore extends FDBStoreBase implements FDBRecordStoreBase<M
         final boolean newStore = reason == RebuildIndexReason.NEW_STORE;
         if (newStore ? LOGGER.isDebugEnabled() : LOGGER.isInfoEnabled()) {
             final KeyValueLogMessage msg = KeyValueLogMessage.build("rebuilding index",
-                    LogMessageKeys.INDEX_NAME, index.getName(),
-                    "indexVersion", index.getLastModifiedVersion(),
-                    "reason", reason.name(),
-                    subspaceProvider.logKey(), subspaceProvider,
-                    LogMessageKeys.SUBSPACE_KEY, index.getSubspaceKey());
+                                            LogMessageKeys.INDEX_NAME, index.getName(),
+                                            LogMessageKeys.INDEX_VERSION, index.getLastModifiedVersion(),
+                                            LogMessageKeys.REASON, reason.name(),
+                                            subspaceProvider.logKey(), subspaceProvider.toString(context),
+                                            LogMessageKeys.SUBSPACE_KEY, index.getSubspaceKey());
             if (newStore) {
                 LOGGER.debug(msg.toString());
             } else {
@@ -2288,15 +2509,16 @@ public class FDBRecordStore extends FDBStoreBase implements FDBRecordStoreBase<M
         final boolean formatVersionChanged = oldFormatVersion != newFormatVersion;
         formatVersion = newFormatVersion;
 
-        final int oldMetaDataVersion = info.getMetaDataversion();
+        final boolean newStore = oldFormatVersion == 0;
+        final int oldMetaDataVersion = newStore ? -1 : info.getMetaDataversion();
         final RecordMetaData metaData = getRecordMetaData();
         final int newMetaDataVersion = metaData.getVersion();
         if (oldMetaDataVersion > newMetaDataVersion) {
             CompletableFuture<Void> ret = new CompletableFuture<>();
             ret.completeExceptionally(new RecordStoreStaleMetaDataVersionException("Local meta-data has stale version",
-                    "localVersion", newMetaDataVersion,
-                    "storedVersion", oldMetaDataVersion,
-                    subspaceProvider.logKey(), subspaceProvider));
+                                        LogMessageKeys.LOCAL_VERSION, newMetaDataVersion,
+                                        LogMessageKeys.STORED_VERSION, oldMetaDataVersion,
+                                        subspaceProvider.logKey(), subspaceProvider.toString(context)));
             return ret;
         }
         final boolean metaDataVersionChanged = oldMetaDataVersion != newMetaDataVersion;
@@ -2306,36 +2528,37 @@ public class FDBRecordStore extends FDBStoreBase implements FDBRecordStoreBase<M
         }
 
         if (LOGGER.isInfoEnabled()) {
-            final boolean newStore = oldFormatVersion == 0;
             if (newStore) {
                 LOGGER.info(KeyValueLogMessage.of("new record store",
                         LogMessageKeys.FORMAT_VERSION, newFormatVersion,
                         LogMessageKeys.META_DATA_VERSION, newMetaDataVersion,
-                        subspaceProvider.logKey(), subspaceProvider));
+                        subspaceProvider.logKey(), subspaceProvider.toString(context)));
             } else {
                 if (formatVersionChanged) {
                     LOGGER.info(KeyValueLogMessage.of("format version changed",
                             LogMessageKeys.OLD_VERSION, oldFormatVersion,
                             LogMessageKeys.NEW_VERSION, newFormatVersion,
-                            subspaceProvider.logKey(), subspaceProvider));
+                            subspaceProvider.logKey(), subspaceProvider.toString(context)));
                 }
                 if (metaDataVersionChanged) {
                     LOGGER.info(KeyValueLogMessage.of("meta-data version changed",
                             LogMessageKeys.OLD_VERSION, oldMetaDataVersion,
                             LogMessageKeys.NEW_VERSION, newMetaDataVersion,
-                            subspaceProvider.logKey(), subspaceProvider));
+                            subspaceProvider.logKey(), subspaceProvider.toString(context)));
                 }
             }
         }
 
         dirty[0] = true;
-        return checkRebuild(userVersionChecker, info, oldFormatVersion, metaData, oldMetaDataVersion);
+        return checkRebuild(userVersionChecker, info, metaData);
     }
 
-    private CompletableFuture<Void> checkRebuild(@Nullable UserVersionChecker userVersionChecker, @Nonnull RecordMetaDataProto.DataStoreInfo.Builder info,
-                                                 int oldFormatVersion, @Nonnull RecordMetaData metaData, int oldMetaDataVersion) {
+    private CompletableFuture<Void> checkRebuild(@Nullable UserVersionChecker userVersionChecker,
+                                                 @Nonnull RecordMetaDataProto.DataStoreInfo.Builder info,
+                                                 @Nonnull RecordMetaData metaData) {
         final List<CompletableFuture<Void>> work = new LinkedList<>();
 
+        final int oldFormatVersion = info.getFormatVersion();
         if (oldFormatVersion != formatVersion) {
             info.setFormatVersion(formatVersion);
             // We must check whether we have to save unsplit records without a suffix before
@@ -2348,7 +2571,7 @@ public class FDBRecordStore extends FDBStoreBase implements FDBRecordStoreBase<M
                     LOGGER.info(KeyValueLogMessage.of("unsplit records stored at old format",
                             LogMessageKeys.OLD_VERSION, oldFormatVersion,
                             LogMessageKeys.NEW_VERSION, formatVersion,
-                            subspaceProvider.logKey(), subspaceProvider));
+                            subspaceProvider.logKey(), subspaceProvider.toString(context)));
                 }
                 info.setOmitUnsplitRecordSuffix(true);
                 omitUnsplitRecordSuffix = true;
@@ -2359,12 +2582,14 @@ public class FDBRecordStore extends FDBStoreBase implements FDBRecordStoreBase<M
                     LOGGER.info(KeyValueLogMessage.of("migrating record versions to new format"),
                             LogMessageKeys.OLD_VERSION, oldFormatVersion,
                             LogMessageKeys.NEW_VERSION, formatVersion,
-                            subspaceProvider.logKey(), subspaceProvider);
+                            subspaceProvider.logKey(), subspaceProvider.toString(context));
                 }
                 addConvertRecordVersions(work);
             }
         }
 
+        final boolean newStore = oldFormatVersion == 0;
+        final int oldMetaDataVersion = newStore ? -1 : info.getMetaDataversion();
         final int newMetaDataVersion = metaData.getVersion();
         final boolean metaDataVersionChanged = oldMetaDataVersion != newMetaDataVersion;
         if (metaDataVersionChanged) {
@@ -2397,17 +2622,16 @@ public class FDBRecordStore extends FDBStoreBase implements FDBRecordStoreBase<M
         final boolean newStore = oldFormatVersion == 0;
         final Map<Index, List<RecordType>> indexes = metaData.getIndexesSince(oldMetaDataVersion);
         if (!indexes.isEmpty()) {
-            CompletableFuture<Long> recordCountFuture = getRecordCountForRebuildIndexes(newStore, rebuildRecordCounts, indexes);
-            return recordCountFuture.thenCompose(recordCount -> {
-                if (recordCount == 0) {
+            // Can only determine overall emptiness (without an additional read) if got count for all record types.
+            Pair<CompletableFuture<Long>, Boolean> counterAndIsAllTypes = getRecordCountForRebuildIndexes(newStore, rebuildRecordCounts, indexes);
+            return counterAndIsAllTypes.getLeft().thenCompose(recordCount -> {
+                if (recordCount == 0 && counterAndIsAllTypes.getRight() &&
+                        formatVersion >= SAVE_UNSPLIT_WITH_SUFFIX_FORMAT_VERSION && omitUnsplitRecordSuffix) {
                     // There are no records. Don't use the legacy split format.
-                    if (formatVersion >= SAVE_UNSPLIT_WITH_SUFFIX_FORMAT_VERSION
-                            && omitUnsplitRecordSuffix
-                            && (newStore ? LOGGER.isDebugEnabled() : LOGGER.isInfoEnabled())) {
+                    if (newStore ? LOGGER.isDebugEnabled() : LOGGER.isInfoEnabled()) {
                         KeyValueLogMessage msg = KeyValueLogMessage.build("upgrading unsplit format on empty store",
-                                "recordCount", recordCount,
-                                "newFormatVersion", formatVersion,
-                                subspaceProvider.logKey(), subspaceProvider);
+                                                    LogMessageKeys.NEW_FORMAT_VERSION, formatVersion,
+                                                    subspaceProvider.logKey(), subspaceProvider.toString(context));
                         if (newStore) {
                             LOGGER.debug(msg.toString());
                         } else {
@@ -2416,6 +2640,7 @@ public class FDBRecordStore extends FDBStoreBase implements FDBRecordStoreBase<M
                     }
                     omitUnsplitRecordSuffix = formatVersion < SAVE_UNSPLIT_WITH_SUFFIX_FORMAT_VERSION;
                     info.clearOmitUnsplitRecordSuffix();
+                    addRecordsReadConflict(); // We used snapshot to determine emptiness, and are now acting on it.
                 }
                 Map<Index, IndexState> newStates = getStatesForRebuildIndexes(userVersionChecker, indexes, recordCount, newStore, rebuildRecordCounts, oldMetaDataVersion, oldFormatVersion);
                 return rebuildIndexes(indexes, newStates, work, newStore ? RebuildIndexReason.NEW_STORE : RebuildIndexReason.FEW_RECORDS, oldMetaDataVersion);
@@ -2425,13 +2650,18 @@ public class FDBRecordStore extends FDBStoreBase implements FDBRecordStoreBase<M
         }
     }
 
+    /**
+     * Get count of records to pass to checker to decide whether to build right away.
+     * @param newStore {@code true} if this is a brand new store
+     * @param rebuildRecordCounts {@code true} if there is a record count key that needs to be rebuilt
+     * @param indexes indexes that need to be built
+     * @return a pair of a future that completes to the record count for the version checker
+     * and a flag that is {@code true} if this count is in fact for all record types
+     */
     @Nonnull
     @SuppressWarnings("PMD.EmptyCatchBlock")
-    protected CompletableFuture<Long> getRecordCountForRebuildIndexes(boolean newStore, boolean rebuildRecordCounts,
-                                                                      @Nonnull Map<Index, List<RecordType>> indexes) {
-        if (recordStoreState == null) {
-            return preloadRecordStoreStateAsync().thenCompose(vignore -> getRecordCountForRebuildIndexes(newStore, rebuildRecordCounts, indexes));
-        }
+    protected Pair<CompletableFuture<Long>, Boolean> getRecordCountForRebuildIndexes(boolean newStore, boolean rebuildRecordCounts,
+                                                                                     @Nonnull Map<Index, List<RecordType>> indexes) {
         // Do this with the new indexes in write-only mode to avoid using one of them
         // when evaluating the snapshot record count.
         MutableRecordStoreState writeOnlyState = recordStoreState.withWriteOnlyIndexes(indexes.keySet().stream().map(Index::getName).collect(Collectors.toList()));
@@ -2442,7 +2672,7 @@ public class FDBRecordStore extends FDBStoreBase implements FDBRecordStoreBase<M
             MutableRecordStoreState saveState = recordStoreState;
             try {
                 recordStoreState = writeOnlyState;
-                return getSnapshotRecordCountForRecordType(singleRecordTypeWithPrefixKey.getName());
+                return Pair.of(getSnapshotRecordCountForRecordType(singleRecordTypeWithPrefixKey.getName()), false);
             } catch (RecordCoreException ex) {
                 // No such index; have to use total record count.
             } finally {
@@ -2454,7 +2684,7 @@ public class FDBRecordStore extends FDBStoreBase implements FDBRecordStoreBase<M
             try {
                 recordStoreState = writeOnlyState;
                 // TODO: FDBRecordStoreBase.checkPossiblyRebuild() could take a long time if the record count index is split into many groups (https://github.com/FoundationDB/fdb-record-layer/issues/7)
-                return getSnapshotRecordCount();
+                return Pair.of(getSnapshotRecordCount(), true);
             } catch (RecordCoreException ex) {
                 // Probably this was from the lack of appropriate index on count; treat like rebuildRecordCounts = true.
             } finally {
@@ -2473,27 +2703,27 @@ public class FDBRecordStore extends FDBStoreBase implements FDBRecordStoreBase<M
         } else {
             records = scanRecords(TupleRange.allOf(singleRecordTypeWithPrefixKey.getRecordTypeKeyTuple()), null, scanProperties);
         }
-        return records.onHasNext()
-                .thenApply(hasAny -> {
-                    if (hasAny) {
-                        if (LOGGER.isInfoEnabled()) {
-                            LOGGER.info(KeyValueLogMessage.of("version check scan found non-empty store",
-                                    subspaceProvider.logKey(), subspaceProvider));
-                        }
-                        return Long.MAX_VALUE;
+        final CompletableFuture<Long> zeroOrInfinity = records.onNext().thenApply(result -> {
+            if (result.hasNext()) {
+                if (LOGGER.isInfoEnabled()) {
+                    LOGGER.info(KeyValueLogMessage.of("version check scan found non-empty store",
+                            subspaceProvider.logKey(), subspaceProvider.toString(context)));
+                }
+                return Long.MAX_VALUE;
+            } else {
+                if (newStore ? LOGGER.isDebugEnabled() : LOGGER.isInfoEnabled()) {
+                    KeyValueLogMessage msg = KeyValueLogMessage.build("version check scan found empty store",
+                            subspaceProvider.logKey(), subspaceProvider.toString(context));
+                    if (newStore) {
+                        LOGGER.debug(msg.toString());
                     } else {
-                        if (newStore ? LOGGER.isDebugEnabled() : LOGGER.isInfoEnabled()) {
-                            KeyValueLogMessage msg = KeyValueLogMessage.build("version check scan found empty store",
-                                    subspaceProvider.logKey(), subspaceProvider);
-                            if (newStore) {
-                                LOGGER.debug(msg.toString());
-                            } else {
-                                LOGGER.info(msg.toString());
-                            }
-                        }
-                        return 0L;
+                        LOGGER.info(msg.toString());
                     }
-                });
+                }
+                return 0L;
+            }
+        });
+        return Pair.of(zeroOrInfinity, singleRecordTypeWithPrefixKey == null);
     }
 
     @Nullable
@@ -2567,12 +2797,12 @@ public class FDBRecordStore extends FDBStoreBase implements FDBRecordStoreBase<M
             }
             newStates.put(index, state);
         }
-        if (newStore ? LOGGER.isDebugEnabled() : LOGGER.isInfoEnabled()) {
+        if (LOGGER.isDebugEnabled()) {
             KeyValueLogMessage msg = KeyValueLogMessage.build("indexes need rebuilding",
-                    "recordCount", recordCount == Long.MAX_VALUE ? "unknown" : Long.toString(recordCount),
-                    subspaceProvider.logKey(), subspaceProvider);
+                                        LogMessageKeys.RECORD_COUNT, recordCount == Long.MAX_VALUE ? "unknown" : Long.toString(recordCount), 
+                                        subspaceProvider.logKey(), subspaceProvider.toString(context));
             if (rebuildRecordCounts) {
-                msg.addKeyAndValue("rebuildRecordCounts", "true");
+                msg.addKeyAndValue(LogMessageKeys.REBUILD_RECORD_COUNTS, "true");
             }
             Map<String, List<String>> stateNames = new HashMap<>();
             for (Map.Entry<Index, IndexState> stateEntry : newStates.entrySet()) {
@@ -2586,12 +2816,11 @@ public class FDBRecordStore extends FDBStoreBase implements FDBRecordStoreBase<M
             }
             msg.addKeysAndValues(stateNames);
             if (newStore) {
-                msg.addKeyAndValue("newStore", "true");
-                LOGGER.debug(msg.toString());
-            } else {
-                LOGGER.info(msg.toString());
+                msg.addKeyAndValue(LogMessageKeys.NEW_STORE, "true");
             }
+            LOGGER.debug(msg.toString());
         }
+        context.increment(FDBStoreTimer.Counts.INDEXES_NEED_REBUILDING, newStates.entrySet().size());
         return newStates;
     }
 
@@ -2609,7 +2838,7 @@ public class FDBRecordStore extends FDBStoreBase implements FDBRecordStoreBase<M
     public void removeFormerIndex(FormerIndex formerIndex) {
         if (LOGGER.isDebugEnabled()) {
             KeyValueLogMessage msg = KeyValueLogMessage.build("removing index",
-                    subspaceProvider.logKey(), subspaceProvider,
+                    subspaceProvider.logKey(), subspaceProvider.toString(context),
                     LogMessageKeys.SUBSPACE_KEY, formerIndex.getSubspaceKey());
             if (formerIndex.getFormerName() != null) {
                 msg.addKeyAndValue(LogMessageKeys.INDEX_NAME, formerIndex.getFormerName());
@@ -2671,7 +2900,7 @@ public class FDBRecordStore extends FDBStoreBase implements FDBRecordStoreBase<M
         }
         if (LOGGER.isDebugEnabled()) {
             LOGGER.debug(KeyValueLogMessage.of("recounting all records",
-                                           subspaceProvider.logKey(), subspaceProvider));
+                                           subspaceProvider.logKey(), subspaceProvider.toString(context)));
         }
         final Map<Key.Evaluated, Long> counts = new HashMap<>();
         final RecordCursor<FDBStoredRecord<Message>> records = scanRecords(null, ScanProperties.FORWARD_SCAN);
@@ -2695,6 +2924,60 @@ public class FDBRecordStore extends FDBStoreBase implements FDBRecordStoreBase<M
     }
 
     /**
+     * Return a cursor of boundaries separating the key ranges maintained by each FDB server. This information can be
+     * useful for splitting a large task (e.g., rebuilding an index for a large record store) into smaller tasks (e.g.,
+     * rebuilding the index for records in certain primary key ranges) more evenly so that they can be executed in a
+     * parallel fashion efficiently. The returned boundaries are an estimate from FDB's locality API and may not
+     * represent the exact boundary locations at any database version.
+     * <p>
+     * The boundaries are returned as a cursor which is sorted and does not contain any duplicates. The first element of
+     * the list is greater than or equal to <code>low</code>, and the last element is less than or equal to
+     * <code>high</code>.
+     * <p>
+     * This implementation may not work when there are too many shard boundaries to complete in a single transaction.
+     * <p>
+     * Note: the returned cursor is blocking and must not be used in an asynchronous context
+     *
+     * @param low low endpoint of primary key range (inclusive)
+     * @param high high endpoint of primary key range (exclusive)
+     * @return the list of boundary primary keys
+     */
+    @API(API.Status.EXPERIMENTAL)
+    @Nonnull
+    public RecordCursor<Tuple> getPrimaryKeyBoundaries(@Nonnull Tuple low, @Nonnull Tuple high) {
+        final Transaction transaction = ensureContextActive();
+        byte[] rangeStart = recordsSubspace().pack(low);
+        byte[] rangeEnd = recordsSubspace().pack(high);
+        CloseableAsyncIterator<byte[]> cursor = context.getDatabase().getLocalityProvider().getBoundaryKeys(transaction, rangeStart, rangeEnd);
+        final boolean hasSplitRecordSuffix = hasSplitRecordSuffix();
+        DistinctFilterCursorClosure closure = new DistinctFilterCursorClosure();
+        return RecordCursor.fromIterator(getExecutor(), cursor)
+                .flatMapPipelined(
+                        result -> RecordCursor.fromIterator(getExecutor(),
+                                transaction.snapshot().getRange(result, rangeEnd, 1).iterator()),
+                        DEFAULT_PIPELINE_SIZE)
+                .map(keyValue -> {
+                    Tuple recordKey = recordsSubspace().unpack(keyValue.getKey());
+                    return hasSplitRecordSuffix ? recordKey.popBack() : recordKey;
+                })
+                // The input stream is expected to be sorted so this filter can work to de-duplicate the data.
+                .filter(closure::pred);
+    }
+
+    private static class DistinctFilterCursorClosure {
+        private Tuple previousKey = null;
+
+        private boolean pred(Tuple key) {
+            if (key.equals(previousKey)) {
+                return false;
+            } else {
+                previousKey = key;
+                return true;
+            }
+        }
+    }
+
+    /**
      * Validate the current meta-data for this store.
      * @deprecated validation is done by {@link com.apple.foundationdb.record.RecordMetaDataBuilder}
      */
@@ -2702,6 +2985,128 @@ public class FDBRecordStore extends FDBStoreBase implements FDBRecordStoreBase<M
     public void validateMetaData() {
         final MetaDataValidator validator = new MetaDataValidator(metaDataProvider, indexMaintainerRegistry);
         validator.validate();
+    }
+
+    @Nonnull
+    public CompletableFuture<byte[]> repairRecordKeys(@Nullable byte[] continuation, @Nonnull ScanProperties scanProperties) {
+        return repairRecordKeys(continuation, scanProperties, false);
+    }
+
+    /**
+     * Validate and repair known potential issues with record keys. Currently, this method is capable of identifying
+     * and repairing the following scenarios:
+     * <ul>
+     *     <li>For record stores in which record splitting is disabled but the {@code omitUnsplitRecordSuffix} flag
+     *         is {@code true}, keys found missing the {@link SplitHelper#UNSPLIT_RECORD} suffix will be repaired.</li>
+     *     <li>For record stores in which record splitting is disabled, but the record key suffix is found to be
+     *         a value other than {@link SplitHelper#UNSPLIT_RECORD}, the {@link FDBStoreTimer.Counts#INVALID_SPLIT_SUFFIX}
+     *         counter will be incremented.
+     *     <li>For record stores in which record splitting is disabled, but the record key is longer than expected,
+     *         the {@link FDBStoreTimer.Counts#INVALID_KEY_LENGTH} counter will be incremented.
+     * </ul>
+     *
+     * @param continuation continuation from a previous repair attempt or {@code null} to start from the beginning
+     * @param scanProperties properties to provide scan limits on the repair process
+     *   record keys should be logged
+     * @param isDryRun if true, no repairs are made, however counters involving irregular keys or keys that would
+     *   would have been repaired are incremented
+     * @return a future that completes to a continuation or {@code null} if the repair has been completed
+     */
+    @Nonnull
+    public CompletableFuture<byte[]> repairRecordKeys(@Nullable byte[] continuation,
+                                                      @Nonnull ScanProperties scanProperties,
+                                                      final boolean isDryRun) {
+        // If the records aren't split to begin with, then there is nothing to do.
+        if (getRecordMetaData().isSplitLongRecords()) {
+            return CompletableFuture.completedFuture(null);
+        }
+
+        if (scanProperties.getExecuteProperties().getIsolationLevel().isSnapshot()) {
+            throw new RecordCoreArgumentException("Cannot repair record key split markers at SNAPSHOT isolation level")
+                    .addLogInfo(LogMessageKeys.SCAN_PROPERTIES, scanProperties);
+        }
+
+        final Subspace recordSubspace = recordsSubspace();
+        KeyValueCursor cursor = KeyValueCursor.Builder.withSubspace(recordSubspace)
+                .setContext(getRecordContext())
+                .setContinuation(continuation)
+                .setScanProperties(scanProperties)
+                .build();
+
+        final AtomicReference<byte[]> nextContinuation = new AtomicReference<>();
+        final FDBRecordContext context = getContext();
+        return AsyncUtil.whileTrue( () ->
+                cursor.onNext().thenApply( result -> {
+                    if (!result.hasNext()) {
+                        if (result.hasStoppedBeforeEnd()) {
+                            nextContinuation.set(result.getContinuation().toBytes());
+                        }
+                        return false;
+                    }
+
+                    repairRecordKeyIfNecessary(context, recordSubspace, result.get(), isDryRun);
+                    return true;
+                })).thenApply(ignored -> nextContinuation.get());
+    }
+
+    private void repairRecordKeyIfNecessary(@Nonnull FDBRecordContext context, @Nonnull Subspace recordSubspace,
+                                            @Nonnull KeyValue keyValue, final boolean isDryRun) {
+        final RecordMetaData metaData = metaDataProvider.getRecordMetaData();
+        final Tuple recordKey = recordSubspace.unpack(keyValue.getKey());
+
+        // Ignore version key
+        if (metaData.isStoreRecordVersions() && isMaybeVersion(recordKey)) {
+            return;
+        }
+
+        final Message record = serializer.deserialize(metaData, recordKey, keyValue.getValue(), getTimer());
+        final RecordType recordType = metaData.getRecordTypeForDescriptor(record.getDescriptorForType());
+
+        final KeyExpression primaryKeyExpression = recordType.getPrimaryKey();
+
+        if (recordKey.size() == primaryKeyExpression.getColumnSize()) {
+            context.increment(FDBStoreTimer.Counts.REPAIR_RECORD_KEY);
+
+            final Tuple newPrimaryKey = recordKey.add(SplitHelper.UNSPLIT_RECORD);
+            if (LOGGER.isDebugEnabled()) {
+                LOGGER.debug(KeyValueLogMessage.of("Repairing primary key",
+                        LogMessageKeys.RECORD_TYPE, recordType.getName(),
+                        subspaceProvider.logKey(), subspaceProvider.toString(context),
+                        "dry_run", isDryRun,
+                        "orig_primary_key", recordKey,
+                        "new_primary_key", newPrimaryKey));
+            }
+
+            if (!isDryRun) {
+                final Transaction tr = context.ensureActive();
+                tr.clear(keyValue.getKey());
+                tr.set(recordSubspace.pack(newPrimaryKey), keyValue.getValue());
+            }
+        } else if (recordKey.size() == primaryKeyExpression.getColumnSize() + 1) {
+            Object suffix = recordKey.get(recordKey.size() - 1);
+            if (!(suffix instanceof Long) || !(((Long) suffix) == SplitHelper.UNSPLIT_RECORD)) {
+                context.increment(FDBStoreTimer.Counts.INVALID_SPLIT_SUFFIX);
+                if (LOGGER.isDebugEnabled()) {
+                    LOGGER.debug(KeyValueLogMessage.of("Invalid split suffix",
+                            subspaceProvider.logKey(), subspaceProvider.toString(context),
+                            LogMessageKeys.RECORD_TYPE, recordType.getName(),
+                            LogMessageKeys.PRIMARY_KEY, recordKey));
+                }
+            }
+        } else  {
+            context.increment(FDBStoreTimer.Counts.INVALID_KEY_LENGTH);
+            if (LOGGER.isDebugEnabled()) {
+                LOGGER.debug(KeyValueLogMessage.of("Invalid key length",
+                        subspaceProvider.logKey(), subspaceProvider.toString(context),
+                        LogMessageKeys.RECORD_TYPE, recordType.getName(),
+                        LogMessageKeys.PRIMARY_KEY, recordKey));
+            }
+        }
+    }
+
+    private boolean isMaybeVersion(Tuple recordKey) {
+        Object suffix = recordKey.get(recordKey.size() - 1);
+        return suffix instanceof Long && (((Long) suffix) == SplitHelper.RECORD_VERSION);
     }
 
     @Nonnull
@@ -2748,9 +3153,6 @@ public class FDBRecordStore extends FDBStoreBase implements FDBRecordStoreBase<M
         private FDBRecordContext context;
 
         @Nullable
-        private SubspaceProvider subspaceProvider;
-
-        @Nullable
         private FDBRecordStoreBase.UserVersionChecker userVersionChecker;
 
         @Nonnull
@@ -2761,6 +3163,12 @@ public class FDBRecordStore extends FDBStoreBase implements FDBRecordStoreBase<M
 
         @Nonnull
         private FDBRecordStoreBase.PipelineSizer pipelineSizer = DEFAULT_PIPELINE_SIZER;
+
+        @Nullable
+        protected SubspaceProvider subspaceProvider = null;
+
+        @Nullable
+        private FDBRecordStoreStateCache storeStateCache = null;
 
         protected Builder() {
         }
@@ -2788,6 +3196,7 @@ public class FDBRecordStore extends FDBStoreBase implements FDBRecordStoreBase<M
             this.indexMaintainerRegistry = other.indexMaintainerRegistry;
             this.indexMaintenanceFilter = other.indexMaintenanceFilter;
             this.pipelineSizer = other.pipelineSizer;
+            this.storeStateCache = other.storeStateCache;
         }
 
         /**
@@ -2803,6 +3212,7 @@ public class FDBRecordStore extends FDBStoreBase implements FDBRecordStoreBase<M
             this.indexMaintainerRegistry = store.indexMaintainerRegistry;
             this.indexMaintenanceFilter = store.indexMaintenanceFilter;
             this.pipelineSizer = store.pipelineSizer;
+            this.storeStateCache = store.storeStateCache;
         }
 
         @Override
@@ -2893,13 +3303,13 @@ public class FDBRecordStore extends FDBStoreBase implements FDBRecordStoreBase<M
             return this;
         }
 
+        /**
+         * Sets the {@link KeySpacePath} location of the {@link FDBRecordStore}.
+         */
         @Override
         @Nonnull
         public Builder setKeySpacePath(@Nullable KeySpacePath keySpacePath) {
-            if (context == null) {
-                throw new RecordCoreException("The context should be set before setting the key space path.");
-            }
-            this.subspaceProvider = keySpacePath == null ? null : new SubspaceProviderByKeySpacePath(keySpacePath, context);
+            this.subspaceProvider = keySpacePath == null ? null : new SubspaceProviderByKeySpacePath(keySpacePath);
             return this;
         }
 
@@ -2956,6 +3366,19 @@ public class FDBRecordStore extends FDBStoreBase implements FDBRecordStoreBase<M
         }
 
         @Override
+        @Nullable
+        public FDBRecordStoreStateCache getStoreStateCache() {
+            return storeStateCache;
+        }
+
+        @Override
+        @Nonnull
+        public Builder setStoreStateCache(@Nullable FDBRecordStoreStateCache storeStateCache) {
+            this.storeStateCache = storeStateCache;
+            return this;
+        }
+
+        @Override
         @Nonnull
         public Builder copyBuilder() {
             return new Builder(this);
@@ -2967,14 +3390,16 @@ public class FDBRecordStore extends FDBStoreBase implements FDBRecordStoreBase<M
             if (context == null) {
                 throw new RecordCoreException("record context must be supplied");
             }
+
             if (subspaceProvider == null) {
                 throw new RecordCoreException("subspace provider must be supplied");
             }
+
             if (serializer == null) {
                 throw new RecordCoreException("serializer must be supplied");
             }
             return new FDBRecordStore(context, subspaceProvider, formatVersion, getMetaDataProviderForBuild(),
-                    serializer, indexMaintainerRegistry, indexMaintenanceFilter, pipelineSizer);
+                    serializer, indexMaintainerRegistry, indexMaintenanceFilter, pipelineSizer, storeStateCache);
         }
 
         @Override
@@ -2994,11 +3419,7 @@ public class FDBRecordStore extends FDBStoreBase implements FDBRecordStoreBase<M
             // Try to do them as much in parallel as possible.
             final CompletableFuture<Void> preloadMetaData = preloadMetaData();
             FDBRecordStore recordStore = build();
-            final CompletableFuture<Void> subspaceFuture = recordStore.preloadSubspaceAsync();
-            final CompletableFuture<Void> loadStoreState = subspaceFuture.thenCompose(vignore -> recordStore.preloadRecordStoreStateAsync());
-            final CompletableFuture<KeyValue> loadStoreInfo = subspaceFuture.thenCompose(vignore -> recordStore.readStoreFirstKey());
-            final CompletableFuture<KeyValue> combinedFuture = CompletableFuture.allOf(preloadMetaData, loadStoreState).thenCombine(loadStoreInfo, (v, kv) -> kv);
-            final CompletableFuture<Boolean> checkVersion = recordStore.checkVersion(combinedFuture, userVersionChecker, existenceCheck);
+            final CompletableFuture<Boolean> checkVersion = recordStore.checkVersion(userVersionChecker, existenceCheck, preloadMetaData);
             return checkVersion.thenApply(vignore -> recordStore);
         }
 

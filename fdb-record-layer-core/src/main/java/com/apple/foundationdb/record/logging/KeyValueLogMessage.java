@@ -20,7 +20,7 @@
 
 package com.apple.foundationdb.record.logging;
 
-import com.apple.foundationdb.API;
+import com.apple.foundationdb.annotation.API;
 
 import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
@@ -89,7 +89,7 @@ public class KeyValueLogMessage {
 
     @Nonnull
     private static String sanitizeValue(@Nonnull final String value) {
-        return value.replace("'", "");
+        return value.replace("\"", "'");
     }
 
     @Nonnull

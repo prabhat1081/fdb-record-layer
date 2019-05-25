@@ -32,10 +32,11 @@ import com.apple.foundationdb.record.RecordCoreRetriableTransactionException;
 import com.apple.foundationdb.record.RecordIndexUniquenessViolation;
 import com.apple.foundationdb.record.RecordMetaData;
 import com.apple.foundationdb.record.RecordMetaDataBuilder;
-import com.apple.foundationdb.record.RecordStoreState;
 import com.apple.foundationdb.record.TestRecords1Proto;
 import com.apple.foundationdb.record.TupleRange;
 import com.apple.foundationdb.record.logging.KeyValueLogMessage;
+import com.apple.foundationdb.record.logging.LogMessageKeys;
+import com.apple.foundationdb.record.logging.TestLogMessageKeys;
 import com.apple.foundationdb.record.metadata.Index;
 import com.apple.foundationdb.record.metadata.IndexAggregateFunction;
 import com.apple.foundationdb.record.metadata.IndexOptions;
@@ -56,9 +57,11 @@ import com.apple.foundationdb.tuple.ByteArrayUtil2;
 import com.apple.foundationdb.tuple.Tuple;
 import com.apple.test.Tags;
 import com.google.common.base.Strings;
+import com.google.common.collect.ImmutableMap;
 import com.google.protobuf.Descriptors;
 import com.google.protobuf.Message;
-import org.hamcrest.Matchers;
+import org.apache.commons.lang3.tuple.Pair;
+import org.apache.logging.log4j.ThreadContext;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
@@ -76,14 +79,17 @@ import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Queue;
 import java.util.Random;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -97,9 +103,16 @@ import java.util.stream.Stream;
 import static com.apple.foundationdb.record.metadata.Key.Expressions.concat;
 import static com.apple.foundationdb.record.metadata.Key.Expressions.field;
 import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.allOf;
 import static org.hamcrest.Matchers.greaterThan;
+import static org.hamcrest.Matchers.greaterThanOrEqualTo;
 import static org.hamcrest.Matchers.instanceOf;
+import static org.hamcrest.Matchers.is;
+import static org.hamcrest.Matchers.isOneOf;
+import static org.hamcrest.Matchers.lessThan;
+import static org.hamcrest.Matchers.lessThanOrEqualTo;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -256,12 +269,12 @@ public class OnlineIndexerTest extends FDBTestBase {
                                int agents, boolean overlap, boolean splitLongRecords,
                                @Nonnull Index index, @Nonnull Runnable beforeBuild, @Nonnull Runnable afterBuild, @Nonnull Runnable afterReadable) {
         LOGGER.info(KeyValueLogMessage.of("beginning rebuild test",
-                "records", records.size(),
-                "recordsWhileBuilding", recordsWhileBuilding == null ? 0 : recordsWhileBuilding.size(),
-                "agents", agents,
-                "overlap", overlap,
-                "splitLongRecords", splitLongRecords,
-                "index", index)
+                        TestLogMessageKeys.RECORDS, records.size(),
+                        LogMessageKeys.RECORDS_WHILE_BUILDING, recordsWhileBuilding == null ? 0 : recordsWhileBuilding.size(),
+                        TestLogMessageKeys.AGENTS, agents,
+                        TestLogMessageKeys.OVERLAP, overlap,
+                        TestLogMessageKeys.SPLIT_LONG_RECORDS, splitLongRecords,
+                        TestLogMessageKeys.INDEX, index)
         );
 
         final RecordMetaDataHook onlySplitHook = metaDataBuilder -> {
@@ -275,7 +288,8 @@ public class OnlineIndexerTest extends FDBTestBase {
             metaDataBuilder.addIndex("MySimpleRecord", index);
         };
 
-        LOGGER.info(KeyValueLogMessage.of("inserting elements prior to test", "records", records.size()));
+        LOGGER.info(KeyValueLogMessage.of("inserting elements prior to test",
+                        TestLogMessageKeys.RECORDS, records.size()));
 
         openSimpleMetaData(onlySplitHook);
         try (FDBRecordContext context = openContext()) {
@@ -292,21 +306,35 @@ public class OnlineIndexerTest extends FDBTestBase {
         LOGGER.info(KeyValueLogMessage.of("running before build for test"));
         beforeBuild.run();
 
-        LOGGER.info(KeyValueLogMessage.of("adding index and marking write-only", "index", index));
+        LOGGER.info(KeyValueLogMessage.of("adding index and marking write-only", TestLogMessageKeys.INDEX, index));
         openSimpleMetaData(hook);
         try (FDBRecordContext context = openContext()) {
             recordStore.markIndexWriteOnly(index).join();
             context.commit();
         }
         LOGGER.info(KeyValueLogMessage.of("creating online index builder",
-                "index", index, "recordTypes", metaData.recordTypesForIndex(index),
-                "subspace", ByteArrayUtil2.loggable(subspace.pack()), "limit", 20, "recordsPerSecond", OnlineIndexer.DEFAULT_RECORDS_PER_SECOND * 100));
-        try (OnlineIndexer indexBuilder = OnlineIndexer.newBuilder()
+                        TestLogMessageKeys.INDEX, index,
+                        TestLogMessageKeys.RECORD_TYPES, metaData.recordTypesForIndex(index),
+                        LogMessageKeys.SUBSPACE, ByteArrayUtil2.loggable(subspace.pack()),
+                        LogMessageKeys.LIMIT, 20,
+                        TestLogMessageKeys.RECORDS_PER_SECOND, OnlineIndexer.DEFAULT_RECORDS_PER_SECOND * 100));
+        final OnlineIndexer.Builder builder = OnlineIndexer.newBuilder()
                 .setDatabase(fdb).setMetaData(metaData).setIndex(index).setSubspace(subspace)
-                .setLimit(20).setMaxRetries(Integer.MAX_VALUE).setRecordsPerSecond(OnlineIndexer.DEFAULT_RECORDS_PER_SECOND * 100)
-                .build()) {
+                .setLimit(20).setMaxRetries(Integer.MAX_VALUE).setRecordsPerSecond(OnlineIndexer.DEFAULT_RECORDS_PER_SECOND * 100);
+        if (ThreadLocalRandom.current().nextBoolean()) {
+            // randomly enable the progress logging to ensure that it doesn't throw exceptions,
+            // or otherwise disrupt the build.
+            LOGGER.info("Setting progress log interval");
+            builder.setProgressLogIntervalMillis(0);
+        }
+
+        try (OnlineIndexer indexBuilder = builder.build()) {
             CompletableFuture<Void> buildFuture;
-            LOGGER.info(KeyValueLogMessage.of("building index", "index", index, "agents", agents, "recordsWhileBuilding", recordsWhileBuilding == null ? 0 : recordsWhileBuilding.size(), "overlap", overlap));
+            LOGGER.info(KeyValueLogMessage.of("building index",
+                            TestLogMessageKeys.INDEX, index,
+                            TestLogMessageKeys.INDEX, agents,
+                            LogMessageKeys.RECORDS_WHILE_BUILDING, recordsWhileBuilding == null ? 0 : recordsWhileBuilding.size(),
+                            TestLogMessageKeys.OVERLAP, overlap));
             if (agents == 1) {
                 buildFuture = indexBuilder.buildIndexAsync(false);
             } else {
@@ -326,6 +354,11 @@ public class OnlineIndexerTest extends FDBTestBase {
                             for (int i = 0; i < agents; i++) {
                                 long itrStart = start + (end - start) / agents * i;
                                 long itrEnd = (i == agents - 1) ? end : start + (end - start) / agents * (i + 1);
+                                LOGGER.info(KeyValueLogMessage.of("building range",
+                                                TestLogMessageKeys.INDEX, index,
+                                                TestLogMessageKeys.AGENT, i,
+                                                TestLogMessageKeys.BEGIN, itrStart,
+                                                TestLogMessageKeys.END, itrEnd));
                                 futures[i] = indexBuilder.buildRange(
                                         Key.Evaluated.scalar(itrStart),
                                         Key.Evaluated.scalar(itrEnd));
@@ -352,13 +385,25 @@ public class OnlineIndexerTest extends FDBTestBase {
             }
 
             buildFuture.join();
-        }
-        LOGGER.info(KeyValueLogMessage.of("building index - completed", "index", index));
 
-        LOGGER.info(KeyValueLogMessage.of("running post build checks", "index", index));
+            // if a record is added to a range that has already been built, it will not be counted, otherwise,
+            // it will.
+            long additionalScans = 0;
+            if (recordsWhileBuilding != null && recordsWhileBuilding.size() > 0) {
+                additionalScans += (long)recordsWhileBuilding.size();
+            }
+            assertThat(indexBuilder.getTotalRecordsScanned(),
+                    allOf(
+                            greaterThanOrEqualTo((long)records.size()),
+                            lessThanOrEqualTo((long)records.size() + additionalScans)
+                    ));
+        }
+        LOGGER.info(KeyValueLogMessage.of("building index - completed", TestLogMessageKeys.INDEX, index));
+
+        LOGGER.info(KeyValueLogMessage.of("running post build checks", TestLogMessageKeys.INDEX, index));
         afterBuild.run();
 
-        LOGGER.info(KeyValueLogMessage.of("verifying range set emptiness", "index", index));
+        LOGGER.info(KeyValueLogMessage.of("verifying range set emptiness", TestLogMessageKeys.INDEX, index));
         try (FDBRecordContext context = openContext()) {
             RangeSet rangeSet = new RangeSet(recordStore.indexRangeSubspace(metaData.getIndex(index.getName())));
             System.out.println("Range set for " + records.size() + " records:\n" + rangeSet.rep(context.ensureActive()).join());
@@ -366,7 +411,7 @@ public class OnlineIndexerTest extends FDBTestBase {
             context.commit();
         }
 
-        LOGGER.info(KeyValueLogMessage.of("marking index readable", "index", index));
+        LOGGER.info(KeyValueLogMessage.of("marking index readable", TestLogMessageKeys.INDEX, index));
         try (FDBRecordContext context = openContext()) {
             assertTrue(recordStore.markIndexReadable(index).join());
             context.commit();
@@ -374,12 +419,12 @@ public class OnlineIndexerTest extends FDBTestBase {
         afterReadable.run();
 
         LOGGER.info(KeyValueLogMessage.of("ending rebuild test",
-                "records", records.size(),
-                "recordsWhileBuilding", recordsWhileBuilding == null ? 0 : recordsWhileBuilding.size(),
-                "agents", agents,
-                "overlap", overlap,
-                "splitLongRecords", splitLongRecords,
-                "index", index)
+                        TestLogMessageKeys.RECORDS, records.size(),
+                        LogMessageKeys.RECORDS_WHILE_BUILDING, recordsWhileBuilding == null ? 0 : recordsWhileBuilding.size(),
+                        TestLogMessageKeys.AGENTS, agents,
+                        TestLogMessageKeys.OVERLAP, overlap,
+                        TestLogMessageKeys.SPLIT_LONG_RECORDS, splitLongRecords,
+                        TestLogMessageKeys.INDEX, index)
         );
     }
 
@@ -2027,6 +2072,7 @@ public class OnlineIndexerTest extends FDBTestBase {
         }
     }
 
+    @SuppressWarnings("try")
     @Test
     public void readableAtEnd() {
         List<TestRecords1Proto.MySimpleRecord> records = LongStream.range(0, 50).mapToObj(val ->
@@ -2051,18 +2097,18 @@ public class OnlineIndexerTest extends FDBTestBase {
             indexBuilder.buildIndex();
         }
 
-        try (FDBRecordContext context = fdb.openContext()) {
-            assertEquals(RecordStoreState.EMPTY, FDBRecordStore.loadRecordStoreStateAsync(context, subspace).join());
+        try (FDBRecordContext context = openContext()) {
+            assertTrue(recordStore.getRecordStoreState().allIndexesReadable());
         }
     }
 
     @Test
     public void run() {
-        Index index = new Index("newIndex", field("num_value_2"));
-        openSimpleMetaData(metaDataBuilder -> metaDataBuilder.addIndex("MySimpleRecord", index));
+        Index index = runAsyncSetup();
         try (OnlineIndexer indexBuilder = OnlineIndexer.newBuilder()
                 .setDatabase(fdb).setMetaData(metaData).setIndex(index).setSubspace(subspace)
                 .setLimit(100).setMaxRetries(3).setRecordsPerSecond(10000)
+                .setMdcContext(ImmutableMap.of("mdcKey", "my cool mdc value"))
                 .setMaxAttempts(2)
                 .build()) {
 
@@ -2070,7 +2116,7 @@ public class OnlineIndexerTest extends FDBTestBase {
 
             // Non-FDB error
             attempts.set(0);
-            indexBuilder.runAsync(store -> {
+            runAndHandleLessenWorkCodes(indexBuilder, store -> {
                 attempts.incrementAndGet();
                 throw new IllegalStateException("illegal state");
             }).handle((val, e) -> {
@@ -2079,12 +2125,13 @@ public class OnlineIndexerTest extends FDBTestBase {
                 assertEquals("illegal state", e.getMessage());
                 assertNull(e.getCause());
                 assertEquals(1, attempts.get());
+                assertEquals("my cool mdc value", ThreadContext.get("mdcKey"));
                 return null;
-            });
+            }).join();
 
             // Retriable error that is not in lessen work codes.
             attempts.set(0);
-            indexBuilder.runAsync(store -> {
+            runAndHandleLessenWorkCodes(indexBuilder, store -> {
                 attempts.incrementAndGet();
                 throw new RecordCoreRetriableTransactionException("Retriable", new FDBException("commit_unknown_result", 1021));
             }).handle((val, e) -> {
@@ -2092,15 +2139,16 @@ public class OnlineIndexerTest extends FDBTestBase {
                 assertThat(e, instanceOf(RecordCoreRetriableTransactionException.class));
                 assertEquals("Retriable", e.getMessage());
                 assertThat(e.getCause(), instanceOf(FDBException.class));
-                assertEquals("commit_unknown_result", e.getMessage());
+                assertEquals("commit_unknown_result", e.getCause().getMessage());
                 assertEquals(1021, ((FDBException)e.getCause()).getCode());
                 assertEquals(2, attempts.get());
+                assertEquals("my cool mdc value", ThreadContext.get("mdcKey"));
                 return null;
-            });
+            }).join();
 
             // Non-retriable error that is in lessen work codes.
             attempts.set(0);
-            indexBuilder.runAsync(store -> {
+            runAndHandleLessenWorkCodes(indexBuilder, store -> {
                 attempts.incrementAndGet();
                 throw new RecordCoreException("Non-retriable", new FDBException("transaction_too_large", 2101));
             }).handle((val, e) -> {
@@ -2109,15 +2157,16 @@ public class OnlineIndexerTest extends FDBTestBase {
                 assertEquals("Non-retriable", e.getMessage());
                 assertNotNull(e.getCause());
                 assertThat(e.getCause(), instanceOf(FDBException.class));
-                assertEquals("transaction_too_large", e.getMessage());
+                assertEquals("transaction_too_large", e.getCause().getMessage());
                 assertEquals(2101, ((FDBException)e.getCause()).getCode());
-                assertEquals(3, attempts.get());
+                assertEquals(4, attempts.get()); // lessenWorkCodes is maxRetries
+                assertEquals("my cool mdc value", ThreadContext.get("mdcKey"));
                 return null;
-            });
+            }).join();
 
             // Retriable error that is in lessen work codes.
             attempts.set(0);
-            indexBuilder.runAsync(store -> {
+            runAndHandleLessenWorkCodes(indexBuilder, store -> {
                 attempts.incrementAndGet();
                 throw new RecordCoreRetriableTransactionException("Retriable and lessener", new FDBException("not_committed", 1020));
             }).handle((val, e) -> {
@@ -2126,12 +2175,223 @@ public class OnlineIndexerTest extends FDBTestBase {
                 assertEquals("Retriable and lessener", e.getMessage());
                 assertNotNull(e.getCause());
                 assertThat(e.getCause(), instanceOf(FDBException.class));
-                assertEquals("not_committed", e.getMessage());
+                assertEquals("not_committed", e.getCause().getMessage());
                 assertEquals(1020, ((FDBException)e.getCause()).getCode());
-                assertEquals(6, attempts.get());
+                assertEquals(8, attempts.get());
+                assertEquals("my cool mdc value", ThreadContext.get("mdcKey"));
                 return null;
-            });
+            }).join();
         }
+    }
+
+    private <R> CompletableFuture<R> runAndHandleLessenWorkCodes(OnlineIndexer indexBuilder, @Nonnull Function<FDBRecordStore, CompletableFuture<R>> function) {
+        return indexBuilder.runAsync(function, Pair::of, indexBuilder::decreaseLimit, null);
+    }
+
+    @Test
+    public void lessenLimits() {
+        Index index = runAsyncSetup();
+        try (OnlineIndexer indexBuilder = OnlineIndexer.newBuilder()
+                .setDatabase(fdb).setMetaData(metaData).setIndex(index).setSubspace(subspace)
+                .setLimit(100).setMaxRetries(30).setRecordsPerSecond(10000)
+                .setMdcContext(ImmutableMap.of("mdcKey", "my cool mdc value"))
+                .setMaxAttempts(3)
+                .build()) {
+
+            AtomicInteger attempts = new AtomicInteger();
+            AtomicInteger limit = new AtomicInteger(100);
+
+            // Non-retriable error that is in lessen work codes.
+            attempts.set(0);
+            indexBuilder.buildAsync((store, recordsScanned) -> {
+                assertEquals(attempts.getAndIncrement(), indexBuilder.getLimit(),
+                        limit.getAndUpdate(x -> Math.max(x, (3 * x) / 4)));
+                throw new RecordCoreException("Non-retriable", new FDBException("transaction_too_large", 2101));
+            }, true, null).handle((val, e) -> {
+                assertNotNull(e);
+                assertThat(e, instanceOf(RecordCoreException.class));
+                assertEquals("Non-retriable", e.getMessage());
+                return null;
+            }).join();
+            assertEquals(31, attempts.get());
+        }
+    }
+
+    @Test
+    void notReincreaseLimit() {
+        // Non-retriable error that is in lessen work codes.
+        Supplier<RuntimeException> createException =
+                () -> new RecordCoreException("Non-retriable", new FDBException("transaction_too_large", 2101));
+
+        Queue<Pair<Integer, Supplier<RuntimeException>>> queue = new LinkedList<>();
+        // failures until it hits 42
+        for (int i = 100; i > 42; i = (3 * i) / 4) {
+            queue.add(Pair.of(i, createException));
+        }
+        // a whole bunch of successes
+        for (int i = 0; i < 100; i++) {
+            queue.add(Pair.of(42, null));
+        }
+        reincreaseLimit(queue, index ->
+                OnlineIndexer.newBuilder()
+                        .setDatabase(fdb).setMetaData(metaData).setIndex(index).setSubspace(subspace)
+                        .setLimit(100).setMaxRetries(queue.size() + 3).setRecordsPerSecond(10000)
+                        .setMdcContext(ImmutableMap.of("mdcKey", "my cool mdc value"))
+                        .setMaxAttempts(3)
+                        .build());
+    }
+
+    @Test
+    public void reincreaseLimit() {
+        // Non-retriable error that is in lessen work codes.
+        Supplier<RuntimeException> createException =
+                () -> new RecordCoreException("Non-retriable", new FDBException("transaction_too_large", 2101));
+
+        Queue<Pair<Integer, Supplier<RuntimeException>>> queue = new LinkedList<>();
+        // failures until it hits 1
+        for (int i = 100; i > 1; i = (3 * i) / 4) {
+            queue.add(Pair.of(i, createException));
+        }
+        // queue size = 13
+        // success for a while
+        for (int i = 0; i < 10; i++) {
+            queue.add(Pair.of(1, null));
+        }
+        // queue size = 23
+        // now starts re-increasing
+        queue.add(Pair.of(2, null));
+        queue.add(Pair.of(3, null));
+        queue.add(Pair.of(4, null));
+        for (int i = 5; i < 100; i = (i * 4) / 3) {
+            queue.add(Pair.of(i, null));
+        }
+        // queue size = 38
+        // does not pass original max
+        queue.add(Pair.of(100, null));
+        queue.add(Pair.of(100, null));
+        queue.add(Pair.of(100, null));
+        for (int i = 100; i > 42; i = (3 * i) / 4) {
+            queue.add(Pair.of(i, createException));
+        }
+        // queue size = 44
+        // success for a while
+        for (int i = 0; i < 10; i++) {
+            queue.add(Pair.of(42, null));
+        }
+        // queue size = 54
+        // fail once
+        queue.add(Pair.of(56, createException));
+        for (int i = 0; i < 10; i++) {
+            queue.add(Pair.of(42, null));
+        }
+        // queue size = 65
+        queue.add(Pair.of(56, createException));
+        queue.add(Pair.of(42, null));
+
+        reincreaseLimit(queue, index ->
+                OnlineIndexer.newBuilder()
+                        .setDatabase(fdb).setMetaData(metaData).setIndex(index).setSubspace(subspace)
+                        .setLimit(100).setMaxRetries(queue.size() + 3).setRecordsPerSecond(10000)
+                        .setIncreaseLimitAfter(10)
+                        .setMdcContext(ImmutableMap.of("mdcKey", "my cool mdc value"))
+                        .setMaxAttempts(3)
+                        .setProgressLogIntervalMillis(0)
+                        .build());
+    }
+
+    private void reincreaseLimit(Queue<Pair<Integer, Supplier<RuntimeException>>> queue,
+                                 final Function<Index, OnlineIndexer> buildOnlineIndexer) {
+        Index index = runAsyncSetup();
+        try (OnlineIndexer indexBuilder = buildOnlineIndexer.apply(index)) {
+
+            AtomicInteger attempts = new AtomicInteger();
+            attempts.set(0);
+            AsyncUtil.whileTrue(() ->
+                    indexBuilder.buildAsync((store, recordsScanned) -> {
+                        Pair<Integer, Supplier<RuntimeException>> behavior = queue.poll();
+                        if (behavior == null) {
+                            return AsyncUtil.READY_FALSE;
+                        } else {
+                            int currentAttempt = attempts.getAndIncrement();
+                            assertEquals(behavior.getLeft().intValue(), indexBuilder.getLimit(),
+                                    "Attempt " + currentAttempt);
+                            if (behavior.getRight() != null) {
+                                throw behavior.getRight().get();
+                            }
+                            return AsyncUtil.READY_TRUE;
+                        }
+                    }, true, null)).join();
+            assertNull(queue.poll());
+        }
+    }
+
+    @Test
+    public void recordsScanned() {
+        Supplier<RuntimeException> nonRetriableException =
+                () -> new RecordCoreException("Non-retriable", new FDBException("transaction_too_large", 2101));
+        Supplier<RuntimeException> retriableException =
+                () -> new RecordCoreRetriableTransactionException("Retriable", new FDBException("not_committed", 1020));
+        Queue<Pair<Long, Supplier<RuntimeException>>> queue = new LinkedList<>();
+
+        queue.add(Pair.of(0L, retriableException));
+        queue.add(Pair.of(0L, nonRetriableException));
+        queue.add(Pair.of(0L, null));
+        queue.add(Pair.of(1L, null));
+        queue.add(Pair.of(2L, null));
+        queue.add(Pair.of(3L, null));
+        queue.add(Pair.of(4L, retriableException));
+        queue.add(Pair.of(4L, retriableException));
+        queue.add(Pair.of(4L, nonRetriableException));
+        queue.add(Pair.of(4L, nonRetriableException));
+        queue.add(Pair.of(4L, null));
+        Index index = runAsyncSetup();
+
+
+        try (OnlineIndexer indexBuilder = OnlineIndexer.newBuilder()
+                .setDatabase(fdb).setMetaData(metaData).setIndex(index).setSubspace(subspace)
+                .setLimit(100).setMaxRetries(queue.size() + 3).setRecordsPerSecond(10000)
+                .setIncreaseLimitAfter(10)
+                .setMdcContext(ImmutableMap.of("mdcKey", "my cool mdc value"))
+                .setMaxAttempts(3)
+                .setProgressLogIntervalMillis(30) // log some of the time, to make sure that doesn't impact things
+                .build()) {
+
+            AtomicInteger attempts = new AtomicInteger();
+            attempts.set(0);
+            AsyncUtil.whileTrue(() -> indexBuilder.buildAsync(
+                    (store, recordsScanned) -> {
+                        Pair<Long, Supplier<RuntimeException>> behavior = queue.poll();
+                        if (behavior == null) {
+                            return AsyncUtil.READY_FALSE;
+                        } else {
+                            int currentAttempt = attempts.getAndIncrement();
+                            assertEquals(1, recordsScanned.incrementAndGet());
+                            assertEquals(behavior.getLeft().longValue(), indexBuilder.getTotalRecordsScanned(),
+                                    "Attempt " + currentAttempt);
+                            if (behavior.getRight() != null) {
+                                throw behavior.getRight().get();
+                            }
+                            return AsyncUtil.READY_TRUE;
+                        }
+                    },
+                    true,
+                    Arrays.asList(LogMessageKeys.CALLING_METHOD, "OnlineIndexerTest.recordsScanned"))
+            ).join();
+            assertNull(queue.poll());
+            assertEquals(5L, indexBuilder.getTotalRecordsScanned());
+        }
+    }
+
+    private Index runAsyncSetup() {
+        Index index = new Index("newIndex", field("num_value_2"));
+        openSimpleMetaData(metaDataBuilder -> metaDataBuilder.addIndex("MySimpleRecord", index));
+
+        try (FDBRecordContext context = openContext()) {
+            // OnlineIndexer.runAsync checks that the index is not readable
+            recordStore.clearAndMarkIndexWriteOnly(index).join();
+            context.commit();
+        }
+        return index;
     }
 
     @Test
@@ -2220,16 +2480,42 @@ public class OnlineIndexerTest extends FDBTestBase {
             while (!future.isDone() && timer.getCount(FDBStoreTimer.Events.COMMIT) < 10 && pass++ < 100) {
                 Thread.sleep(100);
             }
-            assertThat("Should have done several transactions in a few seconds", pass, Matchers.lessThan(100));
+            assertThat("Should have done several transactions in a few seconds", pass, lessThan(100));
         }
         int count1 = timer.getCount(FDBStoreTimer.Events.COMMIT);
         assertThrows(FDBDatabaseRunner.RunnerClosed.class, () -> fdb.asyncToSync(timer, FDBStoreTimer.Waits.WAIT_ONLINE_BUILD_INDEX, future));
         Thread.sleep(50);
         int count2 = timer.getCount(FDBStoreTimer.Events.COMMIT);
         // Might close just after committing but before recording.
-        assertThat("At most one more commits should have occurred", count2, Matchers.isOneOf(count1, count1 + 1));
+        assertThat("At most one more commits should have occurred", count2, isOneOf(count1, count1 + 1));
         Thread.sleep(50);
         int count3 = timer.getCount(FDBStoreTimer.Events.COMMIT);
-        assertThat("No more commits should have occurred", count3, Matchers.is(count2));
+        assertThat("No more commits should have occurred", count3, is(count2));
+    }
+
+    @Test
+    public void markReadable() {
+        Index index = new Index("newIndex", field("num_value_2"));
+        openSimpleMetaData(metaDataBuilder -> metaDataBuilder.addIndex("MySimpleRecord", index));
+
+        try (FDBRecordContext context = openContext()) {
+            // OnlineIndexer.runAsync checks that the index is not readable
+            recordStore.clearAndMarkIndexWriteOnly(index).join();
+            context.commit();
+        }
+
+        try (OnlineIndexer indexer = OnlineIndexer.newBuilder()
+                .setDatabase(fdb).setMetaData(metaData).setIndex(index).setSubspace(subspace)
+                .build()) {
+            // No need to build range because there is no record.
+            indexer.asyncToSync(FDBStoreTimer.Waits.WAIT_ONLINE_BUILD_INDEX, indexer.buildEndpoints());
+
+            // Do mark the the index as readable.
+            assertTrue(indexer.asyncToSync(FDBStoreTimer.Waits.WAIT_ONLINE_BUILD_INDEX, indexer.markReadableIfBuilt()));
+
+            // When the index is readable:
+            assertFalse(indexer.asyncToSync(FDBStoreTimer.Waits.WAIT_ONLINE_BUILD_INDEX, indexer.markReadable())); // The status is not modified by markReadable.
+            assertTrue(indexer.asyncToSync(FDBStoreTimer.Waits.WAIT_ONLINE_BUILD_INDEX, indexer.markReadableIfBuilt()));
+        }
     }
 }

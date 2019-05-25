@@ -20,7 +20,7 @@
 
 package com.apple.foundationdb.record;
 
-import com.apple.foundationdb.API;
+import com.apple.foundationdb.annotation.API;
 
 import javax.annotation.Nonnull;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -55,6 +55,16 @@ public class RecordScanLimiter {
      */
     public boolean tryRecordScan() {
         return allowedRecordScansRemaining.getAndDecrement() > 0;
+    }
+
+    /**
+     * Get the record scan limit. In particular, this will return the target
+     * number of records that this limiter is being used to enforce.
+     *
+     * @return the record scan limit being enforced
+     */
+    public int getLimit() {
+        return originalLimit;
     }
 
     @Override

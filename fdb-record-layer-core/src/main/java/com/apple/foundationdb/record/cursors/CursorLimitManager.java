@@ -20,7 +20,7 @@
 
 package com.apple.foundationdb.record.cursors;
 
-import com.apple.foundationdb.API;
+import com.apple.foundationdb.annotation.API;
 import com.apple.foundationdb.record.ByteScanLimiter;
 import com.apple.foundationdb.record.ExecuteProperties;
 import com.apple.foundationdb.record.RecordCursor;
@@ -122,8 +122,11 @@ public class CursorLimitManager {
     /**
      * Inform the limit manager that a cursor is trying to scan a record. If no limit would be exceeded after scanning
      * another record, return <code>true</code> and update the internal state to reflect that record scan.
-     * If a limit would be exceeded by scanning another record, return <code>false</code> and update the state accordingly.
+     * If a limit would be exceeded by scanning another record, return <code>false</code> and update the state
+     * accordingly.
+     *
      * @return <code>true</code> if another record scan would not exceed any limit and <code>false</code> if it would
+     *
      * @throws ScanLimitReachedException if the scan limit was reached and {@link ExecuteProperties#isFailOnScanLimitReached()}
      */
     public boolean tryRecordScan() {
@@ -136,7 +139,8 @@ public class CursorLimitManager {
         if (!halted) {
             usedInitialPass = true;
         } else if (failOnScanLimitReached) {
-            throw new ScanLimitReachedException("limit on number of key-values scanned per transaction reached");
+            throw new ScanLimitReachedException("limit on number of key-values scanned per transaction reached")
+                    .addLogInfo("no_next_reason", getStoppedReason().map(reason -> reason.toString()).orElse("Unknown."));
         }
 
         return !halted;
@@ -149,7 +153,6 @@ public class CursorLimitManager {
     public void reportScannedBytes(long byteSize) {
         if (byteScanLimiter != null) {
             byteScanLimiter.registerScannedBytes(byteSize);
-            haltedDueToByteScanLimit = !byteScanLimiter.hasBytesRemaining() && usedInitialPass;
         }
     }
 }

@@ -24,7 +24,6 @@ import com.apple.foundationdb.record.EndpointType;
 import com.apple.foundationdb.record.EvaluationContext;
 import com.apple.foundationdb.record.ExecuteProperties;
 import com.apple.foundationdb.record.FunctionNames;
-import com.apple.foundationdb.record.IndexEntry;
 import com.apple.foundationdb.record.IndexScanType;
 import com.apple.foundationdb.record.IsolationLevel;
 import com.apple.foundationdb.record.RecordCursor;
@@ -260,8 +259,18 @@ public class LeaderboardIndexTest extends FDBTestBase {
                     new TimeWindowForFunction(type, timestamp, null, null));
         }
 
-        public Tuple evaluateAggregateFunction(IndexAggregateFunction function, Tuple group) {
-            return recordStore.evaluateAggregateFunction(EvaluationContext.EMPTY, Collections.singletonList(getRecordType()), function, TupleRange.allOf(group), IsolationLevel.SERIALIZABLE).join();
+        public IndexAggregateFunction scoreForTimeWindowRank(int type, long timestamp) {
+            return new TimeWindowAggregateFunction(FunctionNames.SCORE_FOR_TIME_WINDOW_RANK, getKeyExpression(), null,
+                    new TimeWindowForFunction(type, timestamp, null, null));
+        }
+
+        public IndexAggregateFunction timeWindowRankForScore(int type, long timestamp) {
+            return new TimeWindowAggregateFunction(FunctionNames.TIME_WINDOW_RANK_FOR_SCORE, getKeyExpression(), null,
+                    new TimeWindowForFunction(type, timestamp, null, null));
+        }
+
+        public Tuple evaluateAggregateFunction(IndexAggregateFunction function, Tuple values) {
+            return recordStore.evaluateAggregateFunction(EvaluationContext.EMPTY, Collections.singletonList(getRecordType()), function, TupleRange.allOf(values), IsolationLevel.SERIALIZABLE).join();
         }
 
         public List<Key.Evaluated> getScores(FDBRecord<Message> record) {
@@ -269,11 +278,9 @@ public class LeaderboardIndexTest extends FDBTestBase {
         }
 
         public Collection<Tuple> trim(Collection<Key.Evaluated> untrimmed) {
-            List<IndexEntry> untrimmedEntries = untrimmed.stream().map(IndexEntry::new).collect(Collectors.toList());
+            List<Tuple> untrimmedKeys = untrimmed.stream().map(Key.Evaluated::toTuple).collect(Collectors.toList());
             return ((TimeWindowLeaderboardScoreTrimResult)recordStore.performIndexOperation("LeaderboardIndex",
-                    new TimeWindowLeaderboardScoreTrim(untrimmedEntries, true))).getScores().stream()
-                    .map(IndexEntry::getKey)
-                    .collect(Collectors.toList());
+                    new TimeWindowLeaderboardScoreTrim(untrimmedKeys, true))).getScores();
         }
     }
 
@@ -734,6 +741,29 @@ public class LeaderboardIndexTest extends FDBTestBase {
         }
     }
 
+    @Test
+    public void scoreForRank() {
+        Leaderboards leaderboards = new GroupedNestedLeaderboards();
+        basicSetup(leaderboards, true);
+        try (FDBRecordContext context = openContext()) {
+            leaderboards.openRecordStore(context, false);
+
+            assertEquals(750L, leaderboards.evaluateAggregateFunction(leaderboards.scoreForTimeWindowRank(TimeWindowLeaderboard.ALL_TIME_LEADERBOARD_TYPE, -1), Tuple.from("game-1", 1L)).get(0));
+        }
+    }
+
+    @Test
+    public void rankForScore() {
+        Leaderboards leaderboards = new GroupedNestedLeaderboards();
+        basicSetup(leaderboards, true);
+        try (FDBRecordContext context = openContext()) {
+            leaderboards.openRecordStore(context, false);
+
+            assertEquals(1L, leaderboards.evaluateAggregateFunction(leaderboards.timeWindowRankForScore(TimeWindowLeaderboard.ALL_TIME_LEADERBOARD_TYPE, -1), Tuple.from("game-1", 750)).get(0));
+            // This score is not present; it would take over 2nd place.
+            assertEquals(1L, leaderboards.evaluateAggregateFunction(leaderboards.timeWindowRankForScore(TimeWindowLeaderboard.ALL_TIME_LEADERBOARD_TYPE, -1), Tuple.from("game-1", 751)).get(0));
+        }
+    }
 
     @Test
     public void changeUngrouped() {

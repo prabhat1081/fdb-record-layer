@@ -27,15 +27,24 @@ import com.apple.foundationdb.record.RecordMetaData;
 import com.apple.foundationdb.record.TestRecords1Proto;
 import com.apple.foundationdb.tuple.Tuple;
 import com.apple.test.Tags;
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
 import com.google.protobuf.Message;
+import org.apache.logging.log4j.ThreadContext;
 import org.hamcrest.Matchers;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 
+import java.util.List;
+import java.util.Map;
+import java.util.Vector;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.Executor;
+import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
 
 import static com.apple.foundationdb.record.provider.foundationdb.FDBDatabaseTest.testStoreAndRetrieveSimpleRecord;
 import static org.hamcrest.MatcherAssert.assertThat;
@@ -50,8 +59,6 @@ import static org.junit.jupiter.api.Assertions.fail;
  */
 @Tag(Tags.RequiresFDB)
 public class FDBDatabaseRunnerTest extends FDBTestBase {
-
-    private static final Object[] PATH_OBJECTS = {"record-test", "unit"};
 
     private FDBDatabase database;
 
@@ -149,7 +156,7 @@ public class FDBDatabaseRunnerTest extends FDBTestBase {
 
             runner.run(context -> {
                 FDBRecordStore store = FDBRecordStore.newBuilder().setMetaDataProvider(metaData).setContext(context)
-                        .setKeySpacePath(TestKeySpace.getKeyspacePath(PATH_OBJECTS))
+                        .setKeySpacePath(TestKeySpace.getKeyspacePath(FDBRecordStoreTestBase.PATH_OBJECTS))
                         .build();
                 store.deleteRecord(Tuple.from(1066L));
                 return null;
@@ -157,7 +164,7 @@ public class FDBDatabaseRunnerTest extends FDBTestBase {
 
             FDBStoredRecord<Message> retrieved2 = runner.run(context -> {
                 FDBRecordStore store = FDBRecordStore.newBuilder().setMetaDataProvider(metaData).setContext(context)
-                        .setKeySpacePath(TestKeySpace.getKeyspacePath(PATH_OBJECTS))
+                        .setKeySpacePath(TestKeySpace.getKeyspacePath(FDBRecordStoreTestBase.PATH_OBJECTS))
                         .build();
                 return store.loadRecord(Tuple.from(1066L));
             });
@@ -286,14 +293,14 @@ public class FDBDatabaseRunnerTest extends FDBTestBase {
         try (FDBDatabaseRunner runner = database.newRunner()) {
             runner.runAsync(context -> {
                 FDBRecordStore store = FDBRecordStore.newBuilder().setMetaDataProvider(metaData).setContext(context)
-                        .setKeySpacePath(TestKeySpace.getKeyspacePath(PATH_OBJECTS))
+                        .setKeySpacePath(TestKeySpace.getKeyspacePath(FDBRecordStoreTestBase.PATH_OBJECTS))
                         .build();
                 return store.deleteRecordAsync(Tuple.from(1066L));
             }).join();
 
             FDBStoredRecord<Message> retrieved2 = runner.runAsync(context -> {
                 FDBRecordStore store = FDBRecordStore.newBuilder().setMetaDataProvider(metaData).setContext(context)
-                        .setKeySpacePath(TestKeySpace.getKeyspacePath(PATH_OBJECTS))
+                        .setKeySpacePath(TestKeySpace.getKeyspacePath(FDBRecordStoreTestBase.PATH_OBJECTS))
                         .build();
                 return store.loadRecordAsync(Tuple.from(1066L));
             }).join();
@@ -354,5 +361,73 @@ public class FDBDatabaseRunnerTest extends FDBTestBase {
         }
         Thread.sleep(150);
         assertEquals(currentIteration, iteration.get(), "Should have stopped running");
+    }
+
+    @Test
+    void testRestoreMdc() {
+        Executor oldExecutor = FDBDatabaseFactory.instance().getExecutor();
+        try {
+            ThreadContext.clearAll();
+            ThreadContext.put("outer", "Echidna");
+            final Map<String, String> outer = ThreadContext.getContext();
+            final ImmutableMap<String, String> restored = ImmutableMap.of("restored", "Platypus");
+
+            FDBDatabaseFactory.instance().setExecutor(new FDBRecordContext.ContextRestoringExecutor(
+                    new ForkJoinPool(2), ImmutableMap.of("executor", "Water Bear")));
+            AtomicInteger attempts = new AtomicInteger(0);
+            final FDBDatabaseRunner runner = new FDBDatabaseRunner(database, null, restored);
+            List<Map<String, String>> threadContexts = new Vector<>();
+            Consumer<String> saveThreadContext =
+                    name -> threadContexts.add(threadContextPlus(name, attempts.get(), ThreadContext.getContext()));
+            final String runnerRunAsyncName = "runner runAsync";
+            final String supplyAsyncName = "supplyAsync";
+            final String handleName = "handle";
+
+            // Delay starting the future until all callbacks have been set up so that the handle lambda
+            // runs in the context-restoring executor.
+            CompletableFuture<Void> signal = new CompletableFuture<>();
+            CompletableFuture<?> task = runner.runAsync(recordContext -> {
+                saveThreadContext.accept(runnerRunAsyncName);
+                return signal.thenCompose(vignore -> CompletableFuture.supplyAsync(() -> {
+                    saveThreadContext.accept(supplyAsyncName);
+                    if (attempts.getAndIncrement() == 0) {
+                        throw new RecordCoreRetriableTransactionException("Retriable and lessener",
+                                new FDBException("not_committed", 1020));
+                    } else {
+                        return null;
+                    }
+                }, recordContext.getExecutor()));
+            }).handle((result, exception) -> {
+                saveThreadContext.accept(handleName);
+                return exception;
+
+            });
+            signal.complete(null);
+            assertNull(task.join());
+            List<Map<String, String>> expected = ImmutableList.of(
+                    // first attempt:
+                    // it is known behavior that the first will be run in the current context
+                    threadContextPlus(runnerRunAsyncName, 0, outer),
+                    threadContextPlus(supplyAsyncName, 0, restored),
+                    // second attempt
+                    // the code that creates the future, should now have the correct MDC
+                    threadContextPlus(runnerRunAsyncName, 1, restored),
+                    threadContextPlus(supplyAsyncName, 1, restored),
+                    // handle
+                    // this should also have the correct MDC
+                    threadContextPlus(handleName, 2, restored));
+            assertEquals(expected, threadContexts);
+            assertEquals(outer, ThreadContext.getContext());
+        } finally {
+            FDBDatabaseFactory.instance().setExecutor(oldExecutor);
+        }
+
+    }
+
+    private Map<String, String> threadContextPlus(String name, final int attempt, final Map<String, String> threadContext) {
+        return ImmutableMap.<String, String>builder()
+                .put("loc", name)
+                .put("attempt", Integer.toString(attempt))
+                .putAll(threadContext).build();
     }
 }

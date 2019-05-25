@@ -20,7 +20,7 @@
 
 package com.apple.foundationdb.record.metadata;
 
-import com.apple.foundationdb.API;
+import com.apple.foundationdb.annotation.API;
 import com.apple.foundationdb.record.RecordCoreArgumentException;
 import com.apple.foundationdb.record.RecordCoreException;
 import com.apple.foundationdb.record.RecordMetaDataProto;
@@ -35,10 +35,12 @@ import com.google.protobuf.Descriptors;
 
 import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.TreeMap;
 import java.util.stream.IntStream;
 
@@ -67,6 +69,7 @@ public class Index {
     private int[] primaryKeyComponentPositions;
     @Nonnull
     private Object subspaceKey;
+    private boolean useExplicitSubspaceKey = false;
     private int addedVersion;
     private int lastModifiedVersion;
 
@@ -150,11 +153,13 @@ public class Index {
             this.primaryKeyComponentPositions = null;
         }
         this.subspaceKey = normalizeSubspaceKey(name, Tuple.fromBytes(Tuple.from(orig.subspaceKey).pack()));
+        this.useExplicitSubspaceKey = orig.useExplicitSubspaceKey;
         this.addedVersion = orig.addedVersion;
         this.lastModifiedVersion = orig.lastModifiedVersion;
     }
 
     @SuppressWarnings({"deprecation","squid:CallToDeprecatedMethod"}) // Old (deprecated) index type needs grouping compatibility
+    @SpotBugsSuppressWarnings("NP_NONNULL_FIELD_NOT_INITIALIZED_IN_CONSTRUCTOR")
     public Index(@Nonnull RecordMetaDataProto.Index proto) throws KeyExpression.DeserializationException {
         name = proto.getName();
         // Compatibility with old serialized metadata.
@@ -184,9 +189,9 @@ public class Index {
         }
 
         if (proto.hasSubspaceKey()) {
-            subspaceKey = normalizeSubspaceKey(name, decodeSubspaceKey(proto.getSubspaceKey()));
+            setSubspaceKey(normalizeSubspaceKey(name, decodeSubspaceKey(proto.getSubspaceKey())));
         } else {
-            subspaceKey = normalizeSubspaceKey(name, name);
+            setSubspaceKey(normalizeSubspaceKey(name, name));
         }
         if (proto.hasAddedVersion()) {
             addedVersion = proto.getAddedVersion();
@@ -341,7 +346,16 @@ public class Index {
      * @see #getSubspaceKey()
      */
     public void setSubspaceKey(@Nonnull Object subspaceKey) {
+        useExplicitSubspaceKey = true;
         this.subspaceKey = normalizeSubspaceKey(name, subspaceKey);
+    }
+
+    /**
+     * Checks whether the subspace key was set using {@link #setSubspaceKey(Object)}.
+     * @return {@code true} if the subspace key was set using {@code #setSubspaceKey(Object)}
+     */
+    public boolean hasExplicitSubspaceKey() {
+        return useExplicitSubspaceKey;
     }
 
     /**
@@ -458,6 +472,27 @@ public class Index {
     }
 
     /**
+     * Get the primary key portion of an index entry.
+     * @param entry the index entry
+     * @return the primary key extracted from the entry
+     */
+    @Nonnull
+    public Tuple getEntryPrimaryKey(@Nonnull Tuple entry) {
+        List<Object> entryKeys = entry.getItems();
+        List<Object> primaryKeys;
+        if (primaryKeyComponentPositions == null) {
+            primaryKeys = entryKeys.subList(getColumnSize(), entryKeys.size());
+        } else {
+            primaryKeys = new ArrayList<>(primaryKeyComponentPositions.length);
+            int after = getColumnSize();
+            for (int position : primaryKeyComponentPositions) {
+                primaryKeys.add(entryKeys.get(position < 0 ? after++ : position));
+            }
+        }
+        return Tuple.fromList(primaryKeys);
+    }
+
+    /**
      * Synonynm for {@link #getLastModifiedVersion}.
      * @return the last modified version
      * @deprecated use {@link #getLastModifiedVersion}.
@@ -524,9 +559,7 @@ public class Index {
         for (Map.Entry<String, String> entry : options.entrySet()) {
             builder.addOptionsBuilder().setKey(entry.getKey()).setValue(entry.getValue());
         }
-        if (!name.equals(subspaceKey)) {
-            builder.setSubspaceKey(ByteString.copyFrom(Tuple.from(subspaceKey).pack()));
-        }
+        builder.setSubspaceKey(ByteString.copyFrom(Tuple.from(subspaceKey).pack()));
         if (addedVersion > 0) {
             builder.setAddedVersion(addedVersion);
         }
@@ -550,4 +583,27 @@ public class Index {
         return str.toString();
     }
 
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) {
+            return true;
+        } else if (o == null || !getClass().equals(o.getClass())) {
+            return false;
+        }
+        Index that = (Index) o;
+        return this.name.equals(that.name)
+                && this.type.equals(that.type)
+                && this.rootExpression.equals(that.rootExpression)
+                && this.subspaceKey.equals(that.subspaceKey)
+                && this.addedVersion == that.addedVersion
+                && this.lastModifiedVersion == that.lastModifiedVersion
+                && Arrays.equals(this.primaryKeyComponentPositions, that.primaryKeyComponentPositions)
+                && this.options.equals(that.options);
+    }
+
+    @Override
+    public int hashCode() {
+        // Within the context of a single RecordMetaData, this should be sufficient
+        return Objects.hash(name, type);
+    }
 }

@@ -20,14 +20,16 @@
 
 package com.apple.foundationdb.record.provider.foundationdb;
 
-import com.apple.foundationdb.API;
 import com.apple.foundationdb.MutationType;
 import com.apple.foundationdb.ReadTransaction;
 import com.apple.foundationdb.Transaction;
+import com.apple.foundationdb.annotation.API;
 import com.apple.foundationdb.async.AsyncUtil;
+import com.apple.foundationdb.async.MoreAsyncUtil;
 import com.apple.foundationdb.record.RecordCoreStorageException;
 import com.apple.foundationdb.record.SpotBugsSuppressWarnings;
 import com.apple.foundationdb.record.logging.KeyValueLogMessage;
+import com.apple.foundationdb.record.logging.LogMessageKeys;
 import com.apple.foundationdb.record.provider.common.StoreTimer;
 import com.apple.foundationdb.tuple.ByteArrayUtil;
 import com.apple.foundationdb.tuple.ByteArrayUtil2;
@@ -91,10 +93,11 @@ public class FDBRecordContext extends FDBTransactionContext implements AutoClose
     private final Queue<CommitCheckAsync> commitChecks = new ArrayDeque<>();
     @Nonnull
     private final Queue<AfterCommit> afterCommits = new ArrayDeque<>();
+    private boolean dirtyStoreState;
 
     protected FDBRecordContext(@Nonnull FDBDatabase fdb, @Nullable Map<String, String> mdcContext,
                                boolean transactionIsTraced, @Nullable FDBDatabase.WeakReadSemantics weakReadSemantics) {
-        super(fdb, fdb.createTransaction(initExecutor(fdb, mdcContext), transactionIsTraced));
+        super(fdb, fdb.createTransaction(initExecutor(fdb, mdcContext), mdcContext, transactionIsTraced));
         this.transactionCreateTime = System.currentTimeMillis();
         this.localVersion = new AtomicInteger(0);
         this.localVersionCache = new ConcurrentSkipListMap<>();
@@ -113,6 +116,7 @@ public class FDBRecordContext extends FDBTransactionContext implements AutoClose
         }
 
         this.weakReadSemantics = weakReadSemantics;
+        this.dirtyStoreState = false;
     }
 
     public boolean isClosed() {
@@ -156,30 +160,30 @@ public class FDBRecordContext extends FDBTransactionContext implements AutoClose
                 transaction.mutate(valuePair.getLeft(), key, valuePair.getRight()));
         CompletableFuture<byte[]> versionFuture = transaction.getVersionstamp();
         long beforeCommitTimeMillis = System.currentTimeMillis();
-        CompletableFuture<Void> commit = checks.isDone() && !checks.isCompletedExceptionally() ?
-                                         transaction.commit() :
-                                         checks.thenCompose(vignore -> transaction.commit());
+        CompletableFuture<Void> commit = MoreAsyncUtil.isCompletedNormally(checks) ?
+                                         delayedCommit() :
+                                         checks.thenCompose(vignore -> delayedCommit());
+        commit = commit.thenCompose(vignore -> {
+            // The committed version will be -1 if the transaction is read-only,
+            // in which case versionFuture has completed exceptionally with
+            // transaction_read_only and thus can be ignored.
+            committedVersion = transaction.getCommittedVersion();
+            if (committedVersion > 0) {
+                // The getVersionstamp() future can complete a tiny bit after the commit() future.
+                return versionFuture.thenAccept(vs -> versionStamp = vs);
+            } else {
+                return AsyncUtil.DONE;
+            }
+        });
         return commit.whenComplete((v, ex) -> {
             StoreTimer.Event event = FDBStoreTimer.Events.COMMIT;
             try {
                 if (ex != null) {
                     event = FDBStoreTimer.Events.COMMIT_FAILURE;
                 } else {
-                    // The committed version will be -1 if the transaction is read-only,
-                    // in which case versionFuture has completed exceptionally with
-                    // transaction_read_only and thus can be ignored.
-                    committedVersion = transaction.getCommittedVersion();
                     if (committedVersion > 0) {
                         if (database.isTrackLastSeenVersionOnCommit()) {
                             database.updateLastSeenFDBVersion(beforeCommitTimeMillis, committedVersion);
-                        }
-                        try {
-                            // versionFuture has completed already, so we can "wait" here
-                            // safely without actually blocking.
-                            versionStamp = asyncToSync(FDBStoreTimer.Waits.WAIT_VERSION_STAMP, versionFuture);
-                        } catch (RuntimeException e) {
-                            LOGGER.warn(KeyValueLogMessage.of("unable to wait for version stamp",
-                                    "committed_version", committedVersion), e);
                         }
                     } else {
                         event = FDBStoreTimer.Events.COMMIT_READ_ONLY;
@@ -193,6 +197,13 @@ public class FDBRecordContext extends FDBTransactionContext implements AutoClose
                 }
             }
         });
+    }
+
+    /**
+     * Returns a commit that may be delayed due to latency injection.
+     */
+    private CompletableFuture<Void> delayedCommit() {
+        return database.injectLatency(FDBLatencySource.COMMIT_ASYNC).thenCompose(vignore -> transaction.commit());
     }
 
     @Override
@@ -223,6 +234,29 @@ public class FDBRecordContext extends FDBTransactionContext implements AutoClose
 
     public long getTransactionCreateTime() {
         return transactionCreateTime;
+    }
+
+    @API(API.Status.INTERNAL)
+    public void setDirtyStoreState(boolean dirtyStoreState) {
+        this.dirtyStoreState = dirtyStoreState;
+    }
+
+    /**
+     * Return whether any record store opened with this context has had its cache-able store state modified.
+     * This is then used to avoid using the cached state when there have been modifications to the cached state
+     * within this transaction. Note that if multiple record stores are opened within a single transaction
+     * and one (but not all of them) updates its state, then the other record stores will also eschew the
+     * cache.
+     *
+     * <p>
+     * This method is internal to the Record Layer and should not be used by external consumers.
+     * </p>
+     *
+     * @return whether the record store's state has been modified in the course of this transaction
+     */
+    @API(API.Status.INTERNAL)
+    public boolean hasDirtyStoreState() {
+        return dirtyStoreState;
     }
 
     /**
@@ -395,7 +429,7 @@ public class FDBRecordContext extends FDBTransactionContext implements AutoClose
 
     @Nullable
     public <T> T asyncToSync(FDBStoreTimer.Wait event, @Nonnull CompletableFuture<T> async) {
-        if (hookForAsyncToSync != null && (!async.isDone() || async.isCompletedExceptionally())) {
+        if (hookForAsyncToSync != null && !MoreAsyncUtil.isCompletedNormally(async)) {
             hookForAsyncToSync.accept(event);
         }
         return database.asyncToSync(timer, event, async);
@@ -434,7 +468,8 @@ public class FDBRecordContext extends FDBTransactionContext implements AutoClose
             CompletableFuture<Void> future = instrument(FDBStoreTimer.Events.READ_SAMPLE_KEY, ensureActive().get(key))
                     .handle((bytes, ex) -> {
                         if (ex != null) {
-                            LOGGER.warn(KeyValueLogMessage.of("error reading sample key", "key", ByteArrayUtil2.loggable(key)),
+                            LOGGER.warn(KeyValueLogMessage.of("error reading sample key",
+                                            LogMessageKeys.KEY, ByteArrayUtil2.loggable(key)),
                                     ex);
                         }
                         return null;
@@ -520,6 +555,25 @@ public class FDBRecordContext extends FDBTransactionContext implements AutoClose
         for (String key : mdcContext.keySet()) {
             MDC.remove(key);
         }
+    }
+
+    /**
+     * Get a new {@link FDBDatabaseRunner} that will run contexts similar to this one.
+     * <ul>
+     * <li>Same {@linkplain FDBDatabase database}</li>
+     * <li>Same {@linkplain FDBStoreTimer timer}</li>
+     * <li>Same {@linkplain #getMdcContext() MDC context}</li>
+     * <li>Same {@linkplain FDBDatabase.WeakReadSemantics weak read semantics}</li>
+     * </ul>
+     * @return a new database runner based on this context
+     */
+    @Nonnull
+    public FDBDatabaseRunner newRunner() {
+        FDBDatabaseRunner runner = database.newRunner();
+        runner.setTimer(timer);
+        runner.setMdcContext(getMdcContext());
+        runner.setWeakReadSemantics(weakReadSemantics);
+        return runner;
     }
 
     /**

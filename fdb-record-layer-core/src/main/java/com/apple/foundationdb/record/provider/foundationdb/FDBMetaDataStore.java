@@ -20,7 +20,7 @@
 
 package com.apple.foundationdb.record.provider.foundationdb;
 
-import com.apple.foundationdb.API;
+import com.apple.foundationdb.annotation.API;
 import com.apple.foundationdb.async.AsyncUtil;
 import com.apple.foundationdb.record.RecordCoreException;
 import com.apple.foundationdb.record.RecordMetaData;
@@ -31,9 +31,9 @@ import com.apple.foundationdb.record.RecordMetaDataProvider;
 import com.apple.foundationdb.record.SpotBugsSuppressWarnings;
 import com.apple.foundationdb.record.logging.KeyValueLogMessage;
 import com.apple.foundationdb.record.logging.LogMessageKeys;
+import com.apple.foundationdb.record.metadata.Index;
 import com.apple.foundationdb.record.metadata.MetaDataEvolutionValidator;
 import com.apple.foundationdb.record.metadata.MetaDataException;
-import com.apple.foundationdb.record.metadata.Index;
 import com.apple.foundationdb.record.metadata.RecordTypeBuilder;
 import com.apple.foundationdb.record.metadata.expressions.KeyExpression;
 import com.apple.foundationdb.record.provider.foundationdb.keyspace.KeySpacePath;
@@ -52,6 +52,7 @@ import javax.annotation.Nullable;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.function.Consumer;
 
 /**
  * Serialization of {@link RecordMetaData} into the database.
@@ -138,6 +139,11 @@ public class FDBMetaDataStore extends FDBStoreBase implements RecordMetaDataProv
      * statically-generated proto file because the meta-data and record have mismatched descriptors. Using this method,
      * the meta-data can use the same version of the descriptor as the record.
      * See {@link RecordMetaDataBuilder#setLocalFileDescriptor(Descriptors.FileDescriptor)} for more information.
+     * </p>
+     *
+     * <p>
+     * Note that it is not allowed to (a) change the name of the existing record types or (b) change existing
+     * non-{@code NESTED} record types to {@code NESTED} record types in the evolved local file descriptor.
      * </p>
      *
      * @param localFileDescriptor the local descriptor of the meta-data
@@ -247,16 +253,16 @@ public class FDBMetaDataStore extends FDBStoreBase implements RecordMetaDataProv
                     addPendingCacheUpdate(recordMetaData);
                     if (LOGGER.isDebugEnabled()) {
                         LOGGER.debug(KeyValueLogMessage.of("Using cached serialized meta-data",
-                                subspaceProvider.logKey(), subspaceProvider,
+                                subspaceProvider.logKey(), subspaceProvider.toString(context),
                                 LogMessageKeys.VERSION, currentVersion));
                     }
                     return CompletableFuture.completedFuture(metaDataProto);
                 }
                 if (LOGGER.isDebugEnabled()) {
                     LOGGER.debug(KeyValueLogMessage.of("Cached serialized meta-data is out-of-date",
-                            subspaceProvider.logKey(), subspaceProvider,
-                            LogMessageKeys.VERSION, currentVersion,
-                            "cachedVersion", cachedSerializedVersion));
+                                    subspaceProvider.logKey(), subspaceProvider.toString(context),
+                                    LogMessageKeys.VERSION, currentVersion,
+                                    LogMessageKeys.CACHED_VERSION, cachedSerializedVersion));
                 }
             } else {
                 cachedSerializedVersion = 0;
@@ -283,7 +289,7 @@ public class FDBMetaDataStore extends FDBStoreBase implements RecordMetaDataProv
                     }
                     if (LOGGER.isDebugEnabled()) {
                         LOGGER.debug(KeyValueLogMessage.of("Loaded meta-data",
-                                subspaceProvider.logKey(), subspaceProvider,
+                                subspaceProvider.logKey(), subspaceProvider.toString(context),
                                 LogMessageKeys.VERSION, metaDataProto.getVersion()));
                     }
                     return metaDataProto;
@@ -303,7 +309,7 @@ public class FDBMetaDataStore extends FDBStoreBase implements RecordMetaDataProv
                                     if (oldRawRecord != null) {
                                         final byte[] oldBytes = oldRawRecord.getRawRecord();
                                         LOGGER.info(KeyValueLogMessage.of("Upgrading old-format meta-data store",
-                                                subspaceProvider.logKey(), subspaceProvider));
+                                                subspaceProvider.logKey(), subspaceProvider.toString(context)));
                                         ensureContextActive().clear(getSubspace().range(OLD_FORMAT_KEY));
                                         SplitHelper.saveWithSplit(context, getSubspace(), CURRENT_KEY, oldBytes, null);
                                         return oldBytes;
@@ -374,9 +380,9 @@ public class FDBMetaDataStore extends FDBStoreBase implements RecordMetaDataProv
                 int oldVersion = oldProto.getVersion();
                 if (metaDataProto.getVersion() <= oldVersion) {
                     LOGGER.warn(KeyValueLogMessage.of("Meta-data version did not increase",
-                            subspaceProvider.logKey(), subspaceProvider,
-                            "old", oldVersion,
-                            "new", metaDataProto.getVersion()));
+                                    subspaceProvider.logKey(), subspaceProvider.toString(context),
+                                    LogMessageKeys.OLD, oldVersion,
+                                    LogMessageKeys.NEW, metaDataProto.getVersion()));
                     throw new MetaDataException("meta-data version must increase");
                 }
                 // Build the meta-data, but don't use the local file descriptor as this should validate the original descriptors
@@ -426,16 +432,16 @@ public class FDBMetaDataStore extends FDBStoreBase implements RecordMetaDataProv
                             if (currentVersion == recordMetaData.getVersion()) {
                                 if (LOGGER.isDebugEnabled()) {
                                     LOGGER.debug(KeyValueLogMessage.of("Using cached meta-data",
-                                                                   subspaceProvider.logKey(), subspaceProvider,
+                                                                   subspaceProvider.logKey(), subspaceProvider.toString(context),
                                                                    LogMessageKeys.VERSION, currentVersion));
                                 }
                                 return CompletableFuture.completedFuture(recordMetaData);
                             }
                             if (LOGGER.isDebugEnabled()) {
                                 LOGGER.debug(KeyValueLogMessage.of("Cached meta-data is out-of-date",
-                                                               subspaceProvider.logKey(), subspaceProvider,
-                                                               LogMessageKeys.VERSION, currentVersion,
-                                                               "cachedVersion", recordMetaData.getVersion()));
+                                                subspaceProvider.logKey(), subspaceProvider.toString(context),
+                                                LogMessageKeys.VERSION, currentVersion,
+                                                LogMessageKeys.CACHED_VERSION, recordMetaData.getVersion()));
                             }
                             recordMetaData = null;
                         }
@@ -519,13 +525,71 @@ public class FDBMetaDataStore extends FDBStoreBase implements RecordMetaDataProv
         return context.asyncToSync(FDBStoreTimer.Waits.WAIT_LOAD_META_DATA, getRecordMetaDataAsync(true));
     }
 
+    /**
+     * Save the record meta-data into the meta-data store.
+     *
+     * <p>
+     * If the given records descriptor is missing a union message, this method will automatically add one to the descriptor
+     * before saving the meta-data. If the meta-data store is currently empty, a default union descriptor will be added to
+     * the meta-data based on the non-{@code NESTED} record types. Otherwise, it will update the records descriptor of
+     * the currently stored meta-data (see {@link #updateRecords(Descriptors.FileDescriptor)}). The new union descriptor
+     * will include any type in existing union and any new record type in the new file descriptor. This method will
+     * process extension options.
+     * </p>
+     *
+     * @param fileDescriptor the file descriptor of the record meta-data
+     * @see MetaDataProtoEditor#addDefaultUnionIfMissing(Descriptors.FileDescriptor)
+     */
+    @API(API.Status.MAINTAINED)
+    public void saveRecordMetaData(@Nonnull Descriptors.FileDescriptor fileDescriptor) {
+        context.asyncToSync(FDBStoreTimer.Waits.WAIT_SAVE_META_DATA, saveRecordMetaDataAsync(fileDescriptor));
+    }
+
+    /**
+     * Save the record meta-data into the meta-data store.
+     *
+     * @param metaDataProvider the meta-data provider
+     */
     public void saveRecordMetaData(@Nonnull RecordMetaDataProvider metaDataProvider) {
         saveRecordMetaData(metaDataProvider.getRecordMetaData().toProto());
     }
 
+    /**
+     * Save the record meta-data into the meta-data store.
+     *
+     * @param metaDataProto the serialized record meta-data
+     */
     public void saveRecordMetaData(@Nonnull RecordMetaDataProto.MetaData metaDataProto) {
         context.asyncToSync(FDBStoreTimer.Waits.WAIT_SAVE_META_DATA, saveAndSetCurrent(metaDataProto));
     }
+
+    /**
+     * Save the record meta-data into the meta-data store.
+     *
+     * <p>
+     * If the given records descriptor is missing a union message, this method will automatically add one to the descriptor
+     * before saving the meta-data. If the meta-data store is currently empty, a default union descriptor will be added to
+     * the meta-data based on the non-{@code NESTED} record types. Otherwise, it will update the records descriptor of
+     * the currently stored meta-data (see {@link #updateRecords(Descriptors.FileDescriptor)}). The new union descriptor
+     * will include any type in existing union and any new record type in the new file descriptor. This method will
+     * process extension options. Also the records descriptor of the meta-data will change while generating the union.
+     * </p>
+     *
+     * @param fileDescriptor the file descriptor of the record meta-data
+     * @return a future when save is completed
+     * @see MetaDataProtoEditor#addDefaultUnionIfMissing(Descriptors.FileDescriptor)
+     */
+    @API(API.Status.MAINTAINED)
+    public CompletableFuture<Void> saveRecordMetaDataAsync(@Nonnull Descriptors.FileDescriptor fileDescriptor) {
+        return getRecordMetaDataAsync(false).thenCompose(metaData -> {
+            if (metaData == null ) {
+                return saveAndSetCurrent(RecordMetaData.build(MetaDataProtoEditor.addDefaultUnionIfMissing(fileDescriptor)).toProto());
+            } else {
+                return updateRecordsAsync(fileDescriptor);
+            }
+        });
+    }
+
 
     @Nonnull
     private CompletableFuture<RecordMetaDataProto.MetaData> loadCurrentProto() {
@@ -694,8 +758,18 @@ public class FDBMetaDataStore extends FDBStoreBase implements RecordMetaDataProv
      *  Otherwise, {@code updateRecords} will fail.
      * </p>
      *
+     * <p>
+     * If the given file descriptor is missing a union message, this method will add one before updating the meta-data.
+     * The generated union descriptor is constructed by adding any non-{@code NESTED} types in the file descriptor to the
+     * union descriptor from the currently stored meta-data. A new field is not added if a field of the given type already
+     * exists, and the order of any existing fields is preserved. Note that types are identified by name, so renaming
+     * top-level message types may result in validation errors when trying to update the record descriptor. Also the records
+     * descriptor of the meta-data will change while generating the union.
+     * </p>
+     *
      * @param recordsDescriptor the new recordsDescriptor
      */
+    @API(API.Status.MAINTAINED)
     public void updateRecords(@Nonnull Descriptors.FileDescriptor recordsDescriptor) {
         context.asyncToSync(FDBStoreTimer.Waits.WAIT_UPDATE_RECORDS_DESCRIPTOR, updateRecordsAsync(recordsDescriptor));
     }
@@ -710,15 +784,192 @@ public class FDBMetaDataStore extends FDBStoreBase implements RecordMetaDataProv
      *  Otherwise, {@code updateRecordsAsync} will fail.
      * </p>
      *
+     * <p>
+     * If the given file descriptor is missing a union message, this method will add one before updating the meta-data.
+     * The generated union descriptor is constructed by adding any non-{@code NESTED} types in the file descriptor to the
+     * union descriptor from the currently stored meta-data. A new field is not added if a field of the given type already
+     * exists, and the order of any existing fields is preserved. Note that types are identified by name, so renaming
+     * top-level message types may result in validation errors when trying to update the record descriptor.
+     * </p>
+     *
      * @param recordsDescriptor the new recordsDescriptor
      * @return a future that completes when the records descriptor is updated
      */
     @Nonnull
+    @API(API.Status.MAINTAINED)
     public CompletableFuture<Void> updateRecordsAsync(@Nonnull Descriptors.FileDescriptor recordsDescriptor) {
         return loadCurrentProto().thenCompose(metaDataProto -> {
             // Update the records without using its local file descriptor. Let saveAndSetCurrent use the local file descriptor when saving the meta-data.
             RecordMetaDataBuilder recordMetaDataBuilder = createMetaDataBuilder(metaDataProto, false);
-            recordMetaDataBuilder.updateRecords(recordsDescriptor);
+
+            // If union is missing, first add a default union.
+            recordMetaDataBuilder.updateRecords(MetaDataProtoEditor.addDefaultUnionIfMissing(recordsDescriptor, recordMetaDataBuilder.getUnionDescriptor()));
+            return saveAndSetCurrent(recordMetaDataBuilder.getRecordMetaData().toProto());
+        });
+    }
+
+    /**
+     * Mutate the stored meta-data proto using a mutation callback.
+     *
+     * <p>
+     * This method applies the given mutation callback on the stored meta-data and then saves it back to the store.
+     * Callers might need to provide an appropriate {@link MetaDataEvolutionValidator} to the meta-data store, depending on the
+     * changes that the callback performs.
+     * </p>
+     *
+     * <p>
+     * Also, callers must be cautious about modifying the stored records descriptor using mutation callbacks, as this will make the
+     * meta-data store the ultimate (and sole) source of truth for the record definitions and not just the in-database
+     * copy of a {@code .proto} file under source control.
+     * </p>
+     *
+     * @param mutateMetaDataProto a callback that mutates the meta-data proto
+     */
+    public void mutateMetaData(@Nonnull Consumer<RecordMetaDataProto.MetaData.Builder> mutateMetaDataProto) {
+        context.asyncToSync(FDBStoreTimer.Waits.WAIT_MUTATE_METADATA, mutateMetaDataAsync(mutateMetaDataProto));
+    }
+
+    /**
+     * Mutate the stored meta-data proto and record meta-data builder using mutation callbacks.
+     *
+     * <p>
+     * This method applies the given mutation callbacks on the stored meta-data and then saves it back to the store. Note the
+     * order that the callbacks are executed. {@code mutateMetaDataProto} is called first on the meta-data proto and then the
+     * second {@code mutateRecordMetaDataBuilder} is executed on the meta-data builder.
+     * Callers might need to provide an appropriate {@link MetaDataEvolutionValidator} to the meta-data store, depending on the
+     * changes that the callbacks perform.
+     * </p>
+     *
+     * <p>
+     * Also, callers must be cautious about modifying the stored records descriptor using mutation callbacks, as this will make the
+     * meta-data store the ultimate (and sole) source of truth for the record definitions and not just the in-database
+     * copy of a {@code .proto} file under source control.
+     * </p>
+     *
+     * @param mutateMetaDataProto a callback that mutates the meta-data proto
+     * @param mutateRecordMetaDataBuilder a callback that mutates the record meta-data builder after the meta-data proto is mutated
+     */
+    public void mutateMetaData(@Nonnull Consumer<RecordMetaDataProto.MetaData.Builder> mutateMetaDataProto,
+                               @Nullable Consumer<RecordMetaDataBuilder> mutateRecordMetaDataBuilder) {
+        context.asyncToSync(FDBStoreTimer.Waits.WAIT_MUTATE_METADATA, mutateMetaDataAsync(mutateMetaDataProto, mutateRecordMetaDataBuilder));
+    }
+
+    /**
+     * Mutate the stored meta-data proto using a mutation callback asynchronously.
+     *
+     * <p>
+     * This method applies the given mutation callback on the stored meta-data and then saves it back to the store.
+     * Callers might need to provide an appropriate {@link MetaDataEvolutionValidator} to the meta-data store, depending on the
+     * changes that the callback performs.
+     * </p>
+     *
+     * <p>
+     * Also, callers must be cautious about modifying the stored records descriptor using mutation callbacks, as this will make the
+     * meta-data store the ultimate (and sole) source of truth for the record definitions and not just the in-database
+     * copy of a {@code .proto} file under source control.
+     * </p>
+     *
+     * @param mutateMetaDataProto a callback that mutates the meta-data proto
+     * @return a future that completes when the meta-data is mutated
+     */
+    @Nonnull
+    public CompletableFuture<Void> mutateMetaDataAsync(@Nonnull Consumer<RecordMetaDataProto.MetaData.Builder> mutateMetaDataProto) {
+        return mutateMetaDataAsync(mutateMetaDataProto, null);
+    }
+
+    /**
+     * Mutate the stored meta-data proto and record meta-data builder using mutation callbacks asynchronously.
+     *
+     * <p>
+     * This method applies the given mutation callbacks on the stored meta-data and then saves it back to the store. Note the
+     * order that the callbacks are executed. {@code mutateMetaDataProto} is called first on the meta-data proto and then the
+     * second {@code mutateRecordMetaDataBuilder} is executed on the meta-data builder.
+     * Callers might need to provide an appropriate {@link MetaDataEvolutionValidator} to the meta-data store, depending on the
+     * changes that the callbacks perform.
+     * </p>
+     *
+     * <p>
+     * Also, callers must be cautious about modifying the stored records descriptor using mutation callbacks, as this will make the
+     * meta-data store the ultimate (and sole) source of truth for the record definitions and not just the in-database
+     * copy of a {@code .proto} file under source control.
+     * </p>
+     *
+     * @param mutateMetaDataProto a callback that mutates the meta-data proto
+     * @param mutateRecordMetaDataBuilder a callback that mutates the record meta-data builder after the meta-data proto is mutated
+     * @return a future that completes when the meta-data is mutated
+     */
+    @Nonnull
+    public CompletableFuture<Void> mutateMetaDataAsync(@Nonnull Consumer<RecordMetaDataProto.MetaData.Builder> mutateMetaDataProto,
+                                                       @Nullable Consumer<RecordMetaDataBuilder> mutateRecordMetaDataBuilder) {
+        return loadCurrentProto().thenCompose(metaDataProto -> {
+            RecordMetaDataProto.MetaData.Builder metaDataBuilder = metaDataProto.toBuilder();
+            mutateMetaDataProto.accept(metaDataBuilder);
+            RecordMetaDataBuilder recordMetaDataBuilder = createMetaDataBuilder(metaDataBuilder.build());
+            recordMetaDataBuilder.setVersion(metaDataProto.getVersion() + 1);
+            if (mutateRecordMetaDataBuilder != null) {
+                mutateRecordMetaDataBuilder.accept(recordMetaDataBuilder);
+            }
+            return saveAndSetCurrent(recordMetaDataBuilder.getRecordMetaData().toProto());
+        });
+    }
+
+    /**
+     * Update whether record versions should be stored in the meta-data.
+     *
+     * @param storeRecordVersions whether record versions should be stored
+     */
+    public void updateStoreRecordVersions(boolean storeRecordVersions) {
+        context.asyncToSync(FDBStoreTimer.Waits.WAIT_UPDATE_STORE_RECORD_VERSIONS, updateStoreRecordVersionsAsync(storeRecordVersions));
+    }
+
+    /**
+     * Update whether record versions should be stored in the meta-data asynchronously.
+     *
+     * @param storeRecordVersions whether record versions should be stored
+     * @return a future that completes when {@code storeRecordVersions} is updated
+     */
+    @Nonnull
+    public CompletableFuture<Void> updateStoreRecordVersionsAsync(boolean storeRecordVersions) {
+        return loadCurrentProto().thenCompose(metaDataProto -> {
+            RecordMetaDataBuilder recordMetaDataBuilder = createMetaDataBuilder(metaDataProto);
+            recordMetaDataBuilder.setStoreRecordVersions(storeRecordVersions);
+            return saveAndSetCurrent(recordMetaDataBuilder.getRecordMetaData().toProto());
+        });
+    }
+
+    /**
+     * Enable splitting long records.
+     *
+     * <p>
+     * Note that enabling splitting long records could result in data corruption if the record store was initially created with a format version older than
+     * {@link com.apple.foundationdb.record.provider.foundationdb.FDBRecordStore#SAVE_UNSPLIT_WITH_SUFFIX_FORMAT_VERSION}.
+     * Hence the default evolution validator will fail if one enables it. To enable this, first build a custom evolution validator that {@link MetaDataEvolutionValidator#allowsUnsplitToSplit()}
+     * and use {@link #setEvolutionValidator(MetaDataEvolutionValidator)} to set the evolution validator used by this store.
+     * For more details, see {@link MetaDataEvolutionValidator#allowsUnsplitToSplit()}.
+     * </p>
+     */
+    public void enableSplitLongRecords() {
+        context.asyncToSync(FDBStoreTimer.Waits.WAIT_ENABLE_SPLIT_LONG_RECORDS, enableSplitLongRecordsAsync());
+    }
+
+    /**
+     * Enable splitting long records asynchronously.
+     *
+     * <p>
+     * Note that enabling splitting long records could result in data corruption if the record store was initially created with a format version older than
+     * {@link com.apple.foundationdb.record.provider.foundationdb.FDBRecordStore#SAVE_UNSPLIT_WITH_SUFFIX_FORMAT_VERSION}.
+     * Hence the default evolution validator will fail if one enables it. To enable this, first build a custom evolution validator that {@link MetaDataEvolutionValidator#allowsUnsplitToSplit()}
+     * and use {@link #setEvolutionValidator(MetaDataEvolutionValidator)} to set the evolution validator used by this store.
+     * For more details, see {@link MetaDataEvolutionValidator#allowsUnsplitToSplit()}.
+     * </p>
+     *
+     * @return a future that completes when {@code splitLongRecords} is set
+     */
+    @Nonnull
+    public CompletableFuture<Void> enableSplitLongRecordsAsync() {
+        return loadCurrentProto().thenCompose(metaDataProto -> {
+            RecordMetaDataBuilder recordMetaDataBuilder = createMetaDataBuilder(metaDataProto);
+            recordMetaDataBuilder.setSplitLongRecords(true);
             return saveAndSetCurrent(recordMetaDataBuilder.getRecordMetaData().toProto());
         });
     }

@@ -20,7 +20,7 @@
 
 package com.apple.foundationdb.record.query.expressions;
 
-import com.apple.foundationdb.API;
+import com.apple.foundationdb.annotation.API;
 import com.apple.foundationdb.record.FunctionNames;
 import com.apple.foundationdb.record.metadata.IndexRecordFunction;
 import com.apple.foundationdb.record.metadata.Key;
@@ -76,7 +76,7 @@ public class Query {
      * @return a new component that will return the record if all the children match
      */
     @Nonnull
-    public static QueryComponent and(@Nonnull List<QueryComponent> operands) {
+    public static QueryComponent and(@Nonnull List<? extends QueryComponent> operands) {
         return AndComponent.from(operands);
     }
 

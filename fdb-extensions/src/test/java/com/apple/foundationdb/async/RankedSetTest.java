@@ -61,7 +61,7 @@ public class RankedSetTest
 
     @BeforeEach
     public void setUp() throws Exception {
-        FDB fdb = FDB.selectAPIVersion(520);
+        FDB fdb = FDB.selectAPIVersion(600);
         if (TRACE) {
             NetworkOptions options = fdb.options();
             options.setTraceEnable("/tmp");
@@ -184,6 +184,20 @@ public class RankedSetTest
             t.join(60 * 1000);
         }
         assertEquals("[]", uncaught.toString());
+    }
+
+    @Test
+    public void rankAsThoughPresent() {
+        RankedSet rs = newRankedSet();
+        db.run(tr -> {
+            for (int i = 5; i < 100; i += 10) {
+                rs.add(tr, Tuple.from(i).pack()).join();
+            }
+            for (int i = 0; i < 100; i++) {
+                assertEquals((i + 4) / 10, rs.rank(tr, Tuple.from(i).pack(), false).join().intValue());
+            }
+            return null;
+        });
     }
 
     //

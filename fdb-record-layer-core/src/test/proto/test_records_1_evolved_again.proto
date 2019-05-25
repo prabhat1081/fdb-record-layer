@@ -54,6 +54,10 @@ message OneMoreRecord {
   required int64 rec_no = 1 [(field).primary_key = true];
 }
 
+message Record {
+  required int64 rec_no = 1 [(field).primary_key = true];
+}
+
 message RecordTypeUnion {
   optional MySimpleRecord _MySimpleRecord = 1;
   optional MyOtherRecord _MyOtherRecord = 2;

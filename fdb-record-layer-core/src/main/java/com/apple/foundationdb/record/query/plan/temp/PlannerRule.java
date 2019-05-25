@@ -20,7 +20,7 @@
 
 package com.apple.foundationdb.record.query.plan.temp;
 
-import com.apple.foundationdb.API;
+import com.apple.foundationdb.annotation.API;
 import com.apple.foundationdb.record.query.plan.temp.matchers.ExpressionMatcher;
 import com.apple.foundationdb.record.query.plan.temp.matchers.TypeMatcher;
 
@@ -92,5 +92,10 @@ public abstract class PlannerRule<T extends PlannerExpression> {
     public enum ChangesMade {
         NO_CHANGE,
         MADE_CHANGES
+    }
+
+    @Override
+    public String toString() {
+        return getClass().getSimpleName();
     }
 }

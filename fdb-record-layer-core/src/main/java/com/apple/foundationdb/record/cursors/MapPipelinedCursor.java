@@ -20,7 +20,7 @@
 
 package com.apple.foundationdb.record.cursors;
 
-import com.apple.foundationdb.API;
+import com.apple.foundationdb.annotation.API;
 import com.apple.foundationdb.async.AsyncUtil;
 import com.apple.foundationdb.record.RecordCursor;
 import com.apple.foundationdb.record.RecordCursorContinuation;
@@ -81,8 +81,10 @@ public class MapPipelinedCursor<T, V> implements RecordCursor<V> {
 
     @Nonnull
     @Override
-    @API(API.Status.EXPERIMENTAL)
     public CompletableFuture<RecordCursorResult<V>> onNext() {
+        if (nextResult != null && !nextResult.hasNext()) {
+            return CompletableFuture.completedFuture(nextResult);
+        }
         mayGetContinuation = false;
         return AsyncUtil.whileTrue(this::tryToFillPipeline, getExecutor())
                 // pipeline will necessarily contain something if we stopped looping, so pipeline.remove() is nonnull
@@ -99,6 +101,7 @@ public class MapPipelinedCursor<T, V> implements RecordCursor<V> {
 
     @Nonnull
     @Override
+    @Deprecated
     public CompletableFuture<Boolean> onHasNext() {
         if (nextFuture == null) {
             nextFuture = onNext().thenApply(RecordCursorResult::hasNext);
@@ -109,6 +112,7 @@ public class MapPipelinedCursor<T, V> implements RecordCursor<V> {
     @Nullable
     @Override
     @SpotBugsSuppressWarnings(value = "EI2", justification = "copies are expensive")
+    @Deprecated
     public V next() {
         if (!hasNext()) {
             throw new NoSuchElementException();
@@ -121,12 +125,15 @@ public class MapPipelinedCursor<T, V> implements RecordCursor<V> {
     @Nullable
     @Override
     @SpotBugsSuppressWarnings(value = "EI", justification = "copies are expensive")
+    @Deprecated
     public byte[] getContinuation() {
         IllegalContinuationAccessChecker.check(mayGetContinuation);
         return nextResult.getContinuation().toBytes();
     }
 
+    @Nonnull
     @Override
+    @Deprecated
     public NoNextReason getNoNextReason() {
         return nextResult.getNoNextReason();
     }
@@ -215,11 +222,14 @@ public class MapPipelinedCursor<T, V> implements RecordCursor<V> {
     @Nonnull
     private RecordCursorContinuation cancelPendingFutures() {
         Iterator<CompletableFuture<RecordCursorResult<V>>> iter = pipeline.iterator();
-        // the earliest continuation we could need to start with is the one from the last result returned
+        // The earliest continuation we could need to start with is the one from the last returned result.
+        // We may, however, return more results if they are already completed.
         RecordCursorContinuation continuation = nextResult.getContinuation();
         while (iter.hasNext()) {
             CompletableFuture<RecordCursorResult<V>> pendingEntry = iter.next();
             if (!pendingEntry.isDone()) {
+                // Once we have found an entry that is not done, cancel that and all remaining
+                // futures, remove them from the pipeline, and do *not* update the continuation.
                 while (true) {
                     iter.remove();
                     pendingEntry.cancel(false);
@@ -229,7 +239,8 @@ public class MapPipelinedCursor<T, V> implements RecordCursor<V> {
                     pendingEntry = iter.next();
                 }
             } else {
-                // Entry is done, record continuation
+                // Entry is done, so this cursor will return this result. Keep the entry
+                // in the pipeline, and update the continuation.
                 continuation = pendingEntry.join().getContinuation();
             }
         }

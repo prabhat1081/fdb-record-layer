@@ -21,6 +21,7 @@
 package com.apple.foundationdb.record.provider.foundationdb.cursors;
 
 import com.apple.foundationdb.async.AsyncUtil;
+import com.apple.foundationdb.async.MoreAsyncUtil;
 import com.apple.foundationdb.record.RecordCoreException;
 import com.apple.foundationdb.record.RecordCursor;
 import com.apple.foundationdb.record.RecordCursorContinuation;
@@ -28,7 +29,11 @@ import com.apple.foundationdb.record.RecordCursorResult;
 import com.apple.foundationdb.record.RecordCursorVisitor;
 import com.apple.foundationdb.record.cursors.EmptyCursor;
 import com.apple.foundationdb.record.cursors.IllegalContinuationAccessChecker;
+import com.apple.foundationdb.record.logging.KeyValueLogMessage;
+import com.apple.foundationdb.record.logging.LogMessageKeys;
 import com.apple.foundationdb.record.provider.foundationdb.FDBStoreTimer;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
@@ -37,6 +42,7 @@ import java.util.List;
 import java.util.NoSuchElementException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 /**
@@ -49,6 +55,12 @@ import java.util.stream.Collectors;
  * </ul>
  */
 abstract class MergeCursor<T, U, S extends MergeCursorState<T>> implements RecordCursor<U> {
+    // Maximum amount of time to wait before bailing on getting the next state.
+    // Added to investigate: https://github.com/FoundationDB/fdb-record-layer/issues/546
+    // This is not particularly pretty, but it is meant for some rough debugging.
+    private static final long MAX_NEXT_STATE_MILLIS = TimeUnit.SECONDS.toMillis(15);
+    @Nonnull
+    private static final Logger LOGGER = LoggerFactory.getLogger(UnorderedUnionCursor.class);
     @Nonnull
     private final List<S> cursorStates;
     @Nullable
@@ -100,22 +112,47 @@ abstract class MergeCursor<T, U, S extends MergeCursorState<T>> implements Recor
     @SuppressWarnings("squid:S1452")
     @Nonnull
     static <T, S extends MergeCursorState<T>> CompletableFuture<?> whenAny(@Nonnull List<S> cursorStates) {
-        List<S> nonExhausted = new ArrayList<>(cursorStates.size());
+        List<S> nonDoneCursors = new ArrayList<>(cursorStates.size());
         for (S cursorState : cursorStates) {
-            if (!cursorState.isExhausted()) {
-                if (cursorState.getOnNextFuture().isDone()) {
+            if (cursorState.mightHaveNext()) {
+                if (MoreAsyncUtil.isCompletedNormally(cursorState.getOnNextFuture())) {
                     // Short-circuit and return immediately if we find a state that is already done.
                     return AsyncUtil.DONE;
                 } else {
-                    nonExhausted.add(cursorState);
+                    // The cursor might have a next element but its onNext future has either not completed or has
+                    // completed exceptionally. Add it to the list of cursors to wait on so that either its value
+                    // completes the returned future when ready or its error is propagated.
+                    nonDoneCursors.add(cursorState);
                 }
             }
         }
-        if (nonExhausted.isEmpty()) {
-            // Everything is exhausted. Can return immediately.
+        if (nonDoneCursors.isEmpty()) {
+            // No cursor will return any more elements, so we can return immediately.
             return AsyncUtil.DONE;
         } else {
-            return CompletableFuture.anyOf(getOnNextFutures(nonExhausted));
+            return CompletableFuture.anyOf(getOnNextFutures(nonDoneCursors));
+        }
+    }
+
+    void checkNextStateTimeout(long startTime) {
+        long checkStateTime = System.currentTimeMillis();
+        if (checkStateTime - startTime > MAX_NEXT_STATE_MILLIS) {
+            KeyValueLogMessage logMessage = KeyValueLogMessage.build("time computing next state exceeded",
+                                                LogMessageKeys.TIME_STARTED, startTime * 1.0e-3,
+                                                LogMessageKeys.TIME_ENDED, checkStateTime * 1.0e-3,
+                                                LogMessageKeys.DURATION_MILLIS, checkStateTime - startTime,
+                                                LogMessageKeys.CHILD_COUNT, cursorStates.size());
+            if (LOGGER.isDebugEnabled()) {
+                logMessage.addKeyAndValue("child_states", cursorStates.stream()
+                        .map(cursorState -> "(future=" + cursorState.getOnNextFuture() +
+                                            ", result=" + (cursorState.getResult() == null ? "null" : cursorState.getResult().hasNext()) +
+                                            ", cursorClass=" + cursorState.getCursor().getClass().getName() + ")"
+                        )
+                        .collect(Collectors.toList())
+                );
+            }
+            LOGGER.warn(logMessage.toString());
+            throw new RecordCoreException("time computing next state exceeded");
         }
     }
 
@@ -246,6 +283,9 @@ abstract class MergeCursor<T, U, S extends MergeCursorState<T>> implements Recor
     @Override
     @Nonnull
     public CompletableFuture<RecordCursorResult<U>> onNext() {
+        if (nextResult != null && !nextResult.hasNext()) {
+            return CompletableFuture.completedFuture(nextResult);
+        }
         mayGetContinuation = false;
         return computeNextResultStates().thenApply(resultStates -> {
             boolean hasNext = !resultStates.isEmpty();
@@ -263,6 +303,7 @@ abstract class MergeCursor<T, U, S extends MergeCursorState<T>> implements Recor
 
     @Override
     @Nonnull
+    @Deprecated
     public CompletableFuture<Boolean> onHasNext() {
         if (hasNextFuture == null) {
             mayGetContinuation = false;
@@ -273,6 +314,7 @@ abstract class MergeCursor<T, U, S extends MergeCursorState<T>> implements Recor
 
     @Override
     @Nullable
+    @Deprecated
     public U next() {
         if (!hasNext()) {
             throw new NoSuchElementException();
@@ -284,6 +326,7 @@ abstract class MergeCursor<T, U, S extends MergeCursorState<T>> implements Recor
 
     @Override
     @Nullable
+    @Deprecated
     public byte[] getContinuation() {
         IllegalContinuationAccessChecker.check(mayGetContinuation);
         return nextResult.getContinuation().toBytes();
@@ -291,6 +334,7 @@ abstract class MergeCursor<T, U, S extends MergeCursorState<T>> implements Recor
 
     @Override
     @Nonnull
+    @Deprecated
     public NoNextReason getNoNextReason() {
         return nextResult.getNoNextReason();
     }

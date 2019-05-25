@@ -20,7 +20,7 @@
 
 package com.apple.foundationdb.record;
 
-import com.apple.foundationdb.API;
+import com.apple.foundationdb.annotation.API;
 import com.apple.foundationdb.record.metadata.FormerIndex;
 import com.apple.foundationdb.record.metadata.Index;
 import com.apple.foundationdb.record.metadata.IndexTypes;
@@ -35,6 +35,7 @@ import com.apple.foundationdb.record.metadata.expressions.KeyExpression;
 import com.apple.foundationdb.record.metadata.expressions.LiteralKeyExpression;
 import com.apple.foundationdb.record.provider.foundationdb.IndexMaintainerRegistry;
 import com.apple.foundationdb.record.provider.foundationdb.IndexMaintainerRegistryImpl;
+import com.apple.foundationdb.record.provider.foundationdb.MetaDataProtoEditor;
 import com.google.protobuf.DescriptorProtos;
 import com.google.protobuf.Descriptors;
 
@@ -91,7 +92,7 @@ public class RecordMetaDataBuilder implements RecordMetaDataProvider {
     @Nullable
     private Descriptors.Descriptor unionDescriptor;
     @Nullable
-    private Descriptors.Descriptor localUnionDescriptor;
+    private Descriptors.FileDescriptor localFileDescriptor;
     @Nonnull
     private final Map<Descriptors.Descriptor, Descriptors.FieldDescriptor> unionFields;
     @Nonnull
@@ -115,6 +116,8 @@ public class RecordMetaDataBuilder implements RecordMetaDataProvider {
     private RecordMetaData recordMetaData;
     @Nonnull
     private final Map<String, Descriptors.FileDescriptor> explicitDependencies;
+    private long subspaceKeyCounter = 0;
+    private boolean usesSubspaceKeyCounter = false;
 
     /**
      * Creates a blank builder.
@@ -293,9 +296,24 @@ public class RecordMetaDataBuilder implements RecordMetaDataProvider {
                                @Nonnull Descriptors.FileDescriptor[] dependencies,
                                boolean processExtensionOptions) {
         recordsDescriptor = buildFileDescriptor(metaDataProto.getRecords(), dependencies);
+        loadSubspaceKeySettingsFromProto(metaDataProto);
         unionDescriptor = initRecordTypes(recordsDescriptor, processExtensionOptions);
         loadProtoExceptRecords(metaDataProto);
         processSchemaOptions(processExtensionOptions);
+    }
+
+    private void loadSubspaceKeySettingsFromProto(RecordMetaDataProto.MetaData metaDataProto) {
+        if (metaDataProto.hasSubspaceKeyCounter() && !metaDataProto.getUsesSubspaceKeyCounter()) {
+            throw new MetaDataProtoDeserializationException(new MetaDataException("subspaceKeyCounter is set but usesSubspaceKeyCounter is not set in the meta-data proto"));
+        }
+        if (metaDataProto.getUsesSubspaceKeyCounter() && !metaDataProto.hasSubspaceKeyCounter()) {
+            throw new MetaDataProtoDeserializationException(new MetaDataException("usesSubspaceKeyCounter is set but subspaceKeyCounter is not set in the meta-data proto"));
+        }
+        if (!usesSubspaceKeyCounter()) {
+            // Only read from the proto if user has not explicitly enabled it already.
+            usesSubspaceKeyCounter = metaDataProto.getUsesSubspaceKeyCounter();
+        }
+        subspaceKeyCounter = Long.max(subspaceKeyCounter, metaDataProto.getSubspaceKeyCounter()); // User might have set the counter already.
     }
 
     private void loadFromFileDescriptor(@Nonnull Descriptors.FileDescriptor fileDescriptor,
@@ -309,10 +327,11 @@ public class RecordMetaDataBuilder implements RecordMetaDataProvider {
     private Descriptors.Descriptor initRecordTypes(@Nonnull Descriptors.FileDescriptor fileDescriptor, boolean processExtensionOptions) {
         Descriptors.Descriptor unionDescriptor = fetchUnionDescriptor(fileDescriptor);
         validateRecords(fileDescriptor, unionDescriptor);
-        if (localUnionDescriptor != null) {
+        Descriptors.Descriptor localUnionDescriptor = fetchLocalUnionDescriptor(unionDescriptor);
+        if (localFileDescriptor != null) {
             evolutionValidator.validateUnion(unionDescriptor, localUnionDescriptor);
         }
-        fillUnionFields(unionDescriptor, processExtensionOptions);
+        fillUnionFields(unionDescriptor, localUnionDescriptor, processExtensionOptions);
         return localUnionDescriptor == null ? unionDescriptor : localUnionDescriptor;
     }
 
@@ -435,7 +454,7 @@ public class RecordMetaDataBuilder implements RecordMetaDataProvider {
         if (recordsDescriptor != null) {
             throw new MetaDataException("Records already set.");
         }
-        if (localUnionDescriptor != null) {
+        if (localFileDescriptor != null) {
             throw new MetaDataException("Cannot set records from file descriptor when local descriptor is specified.");
         }
         if (!explicitDependencies.isEmpty()) {
@@ -489,7 +508,7 @@ public class RecordMetaDataBuilder implements RecordMetaDataProvider {
         if (this.recordsDescriptor == null) {
             throw new MetaDataException("Records descriptor is not set yet");
         }
-        if (localUnionDescriptor != null) {
+        if (localFileDescriptor != null) {
             throw new MetaDataException("Updating the records descriptor is not allowed when the local file descriptor is set");
         }
         this.recordsDescriptor = recordsDescriptor;
@@ -530,9 +549,33 @@ public class RecordMetaDataBuilder implements RecordMetaDataProvider {
         if (recordsDescriptor != null) {
             throw new MetaDataException("Records already set.");
         }
-        this.localUnionDescriptor = fetchUnionDescriptor(localFileDescriptor);
-        validateRecords(localFileDescriptor, this.localUnionDescriptor);
+        this.localFileDescriptor = localFileDescriptor;
         return this;
+    }
+
+    @Nonnull
+    private Descriptors.Descriptor buildSyntheticUnion(@Nonnull Descriptors.FileDescriptor parentFileDescriptor, @Nonnull Descriptors.Descriptor unionDescriptor) {
+        DescriptorProtos.FileDescriptorProto.Builder builder = DescriptorProtos.FileDescriptorProto.newBuilder();
+        builder.setName("_synthetic_" + parentFileDescriptor.getName());
+        builder.addMessageType(MetaDataProtoEditor.createSyntheticUnion(parentFileDescriptor, unionDescriptor));
+        builder.addDependency(parentFileDescriptor.getName());
+        return fetchUnionDescriptor(buildFileDescriptor(builder.build(), new Descriptors.FileDescriptor[]{parentFileDescriptor}));
+    }
+
+    @Nullable
+    private Descriptors.Descriptor fetchLocalUnionDescriptor(@Nonnull Descriptors.Descriptor unionDescriptor) {
+        if (localFileDescriptor == null) {
+            return null;
+        }
+        Descriptors.Descriptor localUnionDescriptor;
+        if (MetaDataProtoEditor.hasUnion(localFileDescriptor)) {
+            localUnionDescriptor = fetchUnionDescriptor(localFileDescriptor);
+        } else {
+            // The local file descriptor does not have a union. Synthesize it.
+            localUnionDescriptor = buildSyntheticUnion(localFileDescriptor, unionDescriptor);
+        }
+        validateRecords(localFileDescriptor, localUnionDescriptor);
+        return localUnionDescriptor;
     }
 
     /**
@@ -743,9 +786,9 @@ public class RecordMetaDataBuilder implements RecordMetaDataProvider {
         }
     }
 
-    private void fillUnionFields(@Nonnull Descriptors.Descriptor union, boolean processExtensionOptions) {
+    private void fillUnionFields(@Nonnull Descriptors.Descriptor union, @Nullable Descriptors.Descriptor localUnionDescriptor, boolean processExtensionOptions) {
         for (Descriptors.FieldDescriptor unionField : union.getFields()) {
-            Descriptors.FieldDescriptor adjustedUnionField = adjustUnionField(unionField);
+            Descriptors.FieldDescriptor adjustedUnionField = adjustUnionField(unionField, localUnionDescriptor);
             Descriptors.Descriptor descriptor = adjustedUnionField.getMessageType();
             if (!unionFields.containsKey(descriptor)) {
                 processRecordType(adjustedUnionField, processExtensionOptions);
@@ -783,7 +826,7 @@ public class RecordMetaDataBuilder implements RecordMetaDataProvider {
     }
 
     @Nonnull
-    private Descriptors.FieldDescriptor adjustUnionField(@Nonnull Descriptors.FieldDescriptor unionField) {
+    private Descriptors.FieldDescriptor adjustUnionField(@Nonnull Descriptors.FieldDescriptor unionField, @Nullable Descriptors.Descriptor localUnionDescriptor) {
         if (localUnionDescriptor == null) {
             return unionField;
         }
@@ -898,6 +941,9 @@ public class RecordMetaDataBuilder implements RecordMetaDataProvider {
         if (index.getAddedVersion() <= 0) {
             index.setAddedVersion(index.getLastModifiedVersion());
         }
+        if (usesSubspaceKeyCounter && !index.hasExplicitSubspaceKey()) {
+            index.setSubspaceKey(++subspaceKeyCounter);
+        }
         indexes.put(index.getName(), index);
     }
 
@@ -996,6 +1042,10 @@ public class RecordMetaDataBuilder implements RecordMetaDataProvider {
         formerIndexes.add(new FormerIndex(index.getSubspaceKey(), index.getAddedVersion(), ++version, name));
     }
 
+    public void addFormerIndex(@Nonnull FormerIndex formerIndex) {
+        formerIndexes.add(formerIndex);
+    }
+
     public boolean isSplitLongRecords() {
         return splitLongRecords;
     }
@@ -1062,6 +1112,77 @@ public class RecordMetaDataBuilder implements RecordMetaDataProvider {
             throw new MetaDataException("No records added yet");
         }
         this.version = version;
+    }
+
+    /**
+     * Enable counter-based subspace keys assignment.
+     *
+     * <p>
+     * If enabled, index subspace keys will be set using a counter instead of defaulting to the indexes' names. This
+     * must be called prior to setting the records descriptor (for example {@link #setRecords(Descriptors.FileDescriptor)}).
+     * </p>
+     *
+     * <p>
+     * Existing clients should be careful about enabling this feature. The name of an index is the default
+     * value of its subspace key when counter-based subspace keys are disabled. If a subspace key was not set
+     * explicitly before, enabling the counter-based scheme will change the index's subspace key. Note that
+     * it is important that the subspace key of an index that has data does not change.
+     * See {@link Index#setSubspaceKey(Object)} for more details.
+     * </p>
+     *
+     * @return this builder
+     */
+    @Nonnull
+    public RecordMetaDataBuilder enableCounterBasedSubspaceKeys() {
+        if (recordsDescriptor != null) {
+            throw new MetaDataException("Records descriptor has already been set.");
+        }
+        this.usesSubspaceKeyCounter = true;
+        return this;
+    }
+
+    /**
+     * Checks if counter-based subspace key assignment is used.
+     * @return {@code true} if the subspace key counter is used
+     */
+    public boolean usesSubspaceKeyCounter() {
+        return usesSubspaceKeyCounter;
+    }
+
+    /**
+     * Get the current value of the index subspace key counter. If it is not enabled, the value will be 0.
+     * @return the current value of the index subspace key counter
+     * @see #enableCounterBasedSubspaceKeys()
+     */
+    public long getSubspaceKeyCounter() {
+        return subspaceKeyCounter;
+    }
+
+    /**
+     * Set the initial value of the subspace key counter. This method can be handy when users want to assign
+     * subspace keys using a counter, but their indexes already have subspace keys that may conflict with the
+     * counter-based assignment.
+     *
+     * <p>
+     * Note that the new counter must be greater than the current value. Also, users must first enable this feature by
+     * calling {@link #enableCounterBasedSubspaceKeys()} before updating the counter value.
+     * </p>
+     *
+     * @param subspaceKeyCounter the new value
+     * @return this builder
+     * @see #enableCounterBasedSubspaceKeys()
+     */
+    @Nonnull
+    public RecordMetaDataBuilder setSubspaceKeyCounter(long subspaceKeyCounter) {
+        if (!usesSubspaceKeyCounter()) {
+            throw new MetaDataException("Counter-based subspace keys not enabled");
+        }
+        if (subspaceKeyCounter <= this.subspaceKeyCounter) {
+            throw new MetaDataException(String.format("Subspace key counter must be set to a value greater than its current value (%d)",
+                    this.subspaceKeyCounter));
+        }
+        this.subspaceKeyCounter = subspaceKeyCounter;
+        return this;
     }
 
     /**
@@ -1159,9 +1280,9 @@ public class RecordMetaDataBuilder implements RecordMetaDataProvider {
     @Nonnull
     public RecordMetaData build(boolean validate) {
         Map<String, RecordType> recordTypeBuilders = new HashMap<>();
-        RecordMetaData metaData = new RecordMetaData(recordsDescriptor, getUnionDescriptor(), unionFields, recordTypeBuilders,
+        RecordMetaData metaData = new RecordMetaData(recordsDescriptor, unionDescriptor, unionFields, recordTypeBuilders,
                 indexes, universalIndexes, formerIndexes,
-                splitLongRecords, storeRecordVersions, version, recordCountKey);
+                splitLongRecords, storeRecordVersions, version, subspaceKeyCounter, usesSubspaceKeyCounter, recordCountKey);
         for (RecordTypeBuilder recordTypeBuilder : this.recordTypes.values()) {
             KeyExpression primaryKey = recordTypeBuilder.getPrimaryKey();
             if (primaryKey != null) {
@@ -1207,5 +1328,4 @@ public class RecordMetaDataBuilder implements RecordMetaDataProvider {
             super("Error converting from protobuf", cause);
         }
     }
-
 }

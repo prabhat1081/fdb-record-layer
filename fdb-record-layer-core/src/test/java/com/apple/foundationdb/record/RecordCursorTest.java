@@ -52,6 +52,7 @@ import java.util.Optional;
 import java.util.Timer;
 import java.util.TimerTask;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.ScheduledExecutorService;
@@ -67,6 +68,7 @@ import java.util.stream.IntStream;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.greaterThan;
 import static org.hamcrest.Matchers.greaterThanOrEqualTo;
+import static org.hamcrest.Matchers.instanceOf;
 import static org.hamcrest.Matchers.is;
 import static org.hamcrest.Matchers.isOneOf;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -120,11 +122,12 @@ public class RecordCursorTest {
                 } else {
                     return RecordCursorResult.withoutNextValue(RecordCursorEndContinuation.END, NoNextReason.SOURCE_EXHAUSTED);
                 }
-            });
+            }, getExecutor());
         }
 
         @Nonnull
         @Override
+        @Deprecated
         public CompletableFuture<Boolean> onHasNext() {
             onHasNextCalled++;
             // Use thenApplyAsync to deliberately introduce a delay.
@@ -133,17 +136,21 @@ public class RecordCursorTest {
 
         @Nullable
         @Override
+        @Deprecated
         public Integer next() {
             return count--;
         }
 
         @Nullable
         @Override
+        @Deprecated
         public byte[] getContinuation() {
             return null;
         }
 
+        @Nonnull
         @Override
+        @Deprecated
         public NoNextReason getNoNextReason() {
             return NoNextReason.SOURCE_EXHAUSTED;
         }
@@ -221,7 +228,7 @@ public class RecordCursorTest {
     public void orElseTimingErrorTest() throws Exception {
         Function<Executor, RecordCursor<Integer>> elseZero = (executor) -> RecordCursor.fromFuture(executor, CompletableFuture.completedFuture(0));
         for (int i = 0; i < 100000; i++) {
-            RecordCursor<Integer> cursor = RecordCursor.fromList(Collections.<Integer>emptyList()).orElse(elseZero);
+            RecordCursorIterator<Integer> cursor = RecordCursor.fromList(Collections.<Integer>emptyList()).orElse(elseZero).asIterator();
             List<CompletableFuture<Boolean>> futures = new ArrayList<>();
             for (int j = 0; j < 100; j++) {
                 futures.add(cursor.onHasNext());
@@ -334,7 +341,7 @@ public class RecordCursorTest {
         do {
             // Keep stopping and restarting every 3 items.
             int limit = 3;
-            RecordCursor<Integer> cursor = RecordCursor.flatMapPipelined(outerFunc, innerFunc2, continuation, 7);
+            RecordCursorIterator<Integer> cursor = RecordCursor.flatMapPipelined(outerFunc, innerFunc2, continuation, 7).asIterator();
             while (cursor.hasNext()) {
                 pieces.add(cursor.next());
                 if (--limit <= 0) {
@@ -353,7 +360,7 @@ public class RecordCursorTest {
         continuation = null;
         RecordCursor<Integer> partCursor = RecordCursor.flatMapPipelined(outerFunc, innerFunc2, checkFunc, continuation, 7).limitRowsTo(12);
         pieces.addAll(partCursor.asList().get());
-        continuation = partCursor.getContinuation();
+        continuation = partCursor.getNext().getContinuation().toBytes();
         ints.remove(2); // The 3, of which we've done 301, 302
         partCursor = RecordCursor.flatMapPipelined(outerFunc, innerFunc2, checkFunc, continuation, 7);
         pieces.addAll(partCursor.asList().get());
@@ -368,7 +375,7 @@ public class RecordCursorTest {
         continuation = null;
         partCursor = RecordCursor.flatMapPipelined(outerFunc, innerFunc2, checkFunc, continuation, 7).limitRowsTo(12);
         pieces.addAll(partCursor.asList().get());
-        continuation = partCursor.getContinuation();
+        continuation = partCursor.getNext().getContinuation().toBytes();
         ints.add(2, 22); // Before the 3, of which we've done 301, 302
         partCursor = RecordCursor.flatMapPipelined(outerFunc, innerFunc2, checkFunc, continuation, 7);
         pieces.addAll(partCursor.asList().get());
@@ -395,7 +402,7 @@ public class RecordCursorTest {
         boolean done = false;
         byte[] continuation = null;
         while (!done) {
-            RecordCursor<Pair<Integer, Integer>> cursor = cursorFunction.apply(continuation);
+            RecordCursorIterator<Pair<Integer, Integer>> cursor = cursorFunction.apply(continuation).asIterator();
             while (cursor.hasNext()) {
                 Pair<Integer, Integer> value = cursor.next();
                 assertNotNull(value);
@@ -529,7 +536,7 @@ public class RecordCursorTest {
         };
 
         // Outer cursor = 0, 1, 2, all filtered
-        RecordCursor<Pair<Integer, Integer>> cursor = RecordCursor.flatMapPipelined(outerFunc, innerFunc, null, 5);
+        RecordCursorIterator<Pair<Integer, Integer>> cursor = RecordCursor.flatMapPipelined(outerFunc, innerFunc, null, 5).asIterator();
         assertThat(cursor.onHasNext().isDone(), is(false));
         outerCursorRef.get().fire();
         assertThat(cursor.hasNext(), is(false));
@@ -538,7 +545,7 @@ public class RecordCursorTest {
         byte[] continuation = cursor.getContinuation();
 
         // Outer cursor = 3, 4, 5, all filtered
-        cursor = RecordCursor.flatMapPipelined(outerFunc, innerFunc, continuation, 5);
+        cursor = RecordCursor.flatMapPipelined(outerFunc, innerFunc, continuation, 5).asIterator();
         assertThat(cursor.onHasNext().isDone(), is(false));
         outerCursorRef.get().fire();
         assertThat(cursor.hasNext(), is(false));
@@ -547,7 +554,7 @@ public class RecordCursorTest {
         continuation = cursor.getContinuation();
 
         // Outer cursor = 6 (filtered), 7 (filtered), 8 (not filtered)
-        cursor = RecordCursor.flatMapPipelined(outerFunc, innerFunc, continuation, 5);
+        cursor = RecordCursor.flatMapPipelined(outerFunc, innerFunc, continuation, 5).asIterator();
         outerCursorRef.get().fire();
         for (int i = 0; i < ints.size(); i++) {
             Pair<Integer, Integer> nextValue = cursor.next();
@@ -562,7 +569,7 @@ public class RecordCursorTest {
         continuation = cursor.getContinuation();
 
         // Outer cursor = 9 (not filtered)
-        cursor = RecordCursor.flatMapPipelined(outerFunc, innerFunc, continuation, 5);
+        cursor = RecordCursor.flatMapPipelined(outerFunc, innerFunc, continuation, 5).asIterator();
         outerCursorRef.get().fire();
         for (int i = 0; i < ints.size(); i++) {
             Pair<Integer, Integer> nextValue = cursor.next();
@@ -577,9 +584,223 @@ public class RecordCursorTest {
     }
 
     @Test
+    public void flatMapPipelineErrorPropagation() throws ExecutionException, InterruptedException {
+        FirableCursor<String> firableCursor1 = new FirableCursor<>(RecordCursor.fromList(Collections.singletonList("hello")));
+        FirableCursor<String> firableCursor2 = new FirableCursor<>(new BrokenCursor());
+        List<FirableCursor<String>> firableCursors = Arrays.asList(firableCursor1, firableCursor2);
+        FirableCursor<Integer> outerCursor = new FirableCursor<>(RecordCursor.fromList(Arrays.asList(0, 1)));
+        RecordCursor<String> cursor = outerCursor.flatMapPipelined(firableCursors::get, 10);
+        outerCursor.fire();
+        firableCursor1.fire();
+        RecordCursorResult<String> cursorResult = cursor.onNext().get();
+        assertTrue(cursorResult.hasNext());
+        assertEquals("hello", cursorResult.get());
+        CompletableFuture<RecordCursorResult<String>> nextResultFuture = cursor.onNext();
+        firableCursor1.fire();
+        assertFalse(nextResultFuture.isDone());
+        outerCursor.fire();
+        firableCursor2.fire();
+        ExecutionException e = assertThrows(ExecutionException.class, nextResultFuture::get);
+        assertNotNull(e.getCause());
+        assertThat(e.getCause(), instanceOf(RuntimeException.class));
+        assertEquals("sorry", e.getCause().getMessage());
+
+        RecordCursor<Integer> outerCursorError = new BrokenCursor().flatMapPipelined((String s) -> RecordCursor.fromList(Collections.singletonList(s.length())), 10);
+        e = assertThrows(ExecutionException.class, () -> outerCursorError.onNext().get());
+        assertNotNull(e.getCause());
+        assertThat(e.getCause(), instanceOf(RuntimeException.class));
+        assertEquals("sorry", e.getCause().getMessage());
+    }
+
+    /**
+     * Test that when the outer cursor and an inner future complete "at the same time" (as close as we can) that the
+     * error is propagated.
+     *
+     * @throws ExecutionException from futures joined in the test
+     * @throws InterruptedException from futures joined in the test
+     */
+    @Test
+    public void mapPipelinedErrorAtConcurrentCompletion() throws ExecutionException, InterruptedException {
+        final RuntimeException runtimeEx = new RuntimeException("some random exception");
+
+        List<CompletableFuture<Integer>> futures = Arrays.asList(new CompletableFuture<>(), new CompletableFuture<>(), new CompletableFuture<>());
+        FirableCursor<Integer> firableCursor = new FirableCursor<>(RecordCursor.fromList(Arrays.asList(0, 1, 2)));
+        RecordCursor<Integer> cursor = firableCursor.mapPipelined(futures::get, 2);
+        CompletableFuture<RecordCursorResult<Integer>> resultFuture = cursor.onNext();
+        assertFalse(resultFuture.isDone());
+        firableCursor.fire();
+        assertFalse(resultFuture.isDone());
+        futures.get(0).complete(1066);
+        RecordCursorResult<Integer> result = resultFuture.get();
+        assertTrue(result.hasNext());
+        assertEquals(1066, (int)result.get());
+
+        // The (non-exceptional) firable cursor completes at "the same time" as the exceptional inner result.
+        CompletableFuture<RecordCursorResult<Integer>> secondResultFuture = cursor.onNext();
+        assertFalse(secondResultFuture.isDone());
+        firableCursor.fire();
+        assertFalse(secondResultFuture.isDone());
+        firableCursor.fire();
+        futures.get(1).completeExceptionally(runtimeEx);
+        ExecutionException executionEx = assertThrows(ExecutionException.class, secondResultFuture::get);
+        assertNotNull(executionEx.getCause());
+        assertEquals(runtimeEx, executionEx.getCause());
+
+        // Should get the same exception again
+        executionEx = assertThrows(ExecutionException.class, () -> cursor.onNext().get());
+        assertEquals(runtimeEx, executionEx.getCause());
+    }
+
+    /**
+     * Test that when an exceptional future gets put in the pipeline of a {@code MapPipelinedCursor} that the
+     * error is (eventually) propagated.
+     *
+     * @throws ExecutionException from futures joined in the test
+     * @throws InterruptedException from futures joined in the test
+     */
+    @Test
+    public void mapPipelinedErrorPropagationInPipeline() throws ExecutionException, InterruptedException {
+        final RuntimeException runtimeEx = new RuntimeException("some random exception");
+        List<CompletableFuture<Integer>> futures = Arrays.asList(new CompletableFuture<>(), new CompletableFuture<>(), new CompletableFuture<>());
+        RecordCursor<Integer> cursor = RecordCursor.fromList(Arrays.asList(0, 1, 2)).mapPipelined(futures::get, 2);
+        CompletableFuture<RecordCursorResult<Integer>> resultFuture = cursor.onNext();
+        assertFalse(resultFuture.isDone());
+        futures.get(1).completeExceptionally(runtimeEx);
+        assertFalse(resultFuture.isDone());
+        futures.get(0).complete(1066);
+        RecordCursorResult<Integer> result = resultFuture.get();
+        assertTrue(result.hasNext());
+        assertEquals(1066, (int)result.get());
+
+        CompletableFuture<RecordCursorResult<Integer>> secondResultFuture = cursor.onNext();
+        ExecutionException executionEx = assertThrows(ExecutionException.class, secondResultFuture::get);
+        assertNotNull(executionEx.getCause());
+        assertEquals(runtimeEx, executionEx.getCause());
+
+        // Should get the same exception again
+        executionEx = assertThrows(ExecutionException.class, () -> cursor.onNext().get());
+        assertEquals(runtimeEx, executionEx.getCause());
+    }
+
+    /**
+     * Check the continuation returned when there is a time limit encountered while filling the pipeline of a
+     * map pipelined cursor. Here, make sure that if the first future to be returned after the limit limit is reached,
+     * then "time limit reached" is returned immediately and the continuation matches the last returned result.
+     *
+     * @throws ExecutionException from futures joined in the test
+     * @throws InterruptedException from futures joined in the test
+     */
+    @Test
+    public void mapPipelinedContinuationWithTimeLimit() throws ExecutionException, InterruptedException {
+        List<CompletableFuture<Integer>> futures = Arrays.asList(new CompletableFuture<>(), new CompletableFuture<>(), new CompletableFuture<>(), new CompletableFuture<>());
+        RecordCursor<Integer> cursor = new FakeOutOfBandCursor<>(RecordCursor.fromList(Arrays.asList(0, 1, 2, 3)), 3).mapPipelined(futures::get, 3);
+        futures.get(2).complete(1415); // complete a future that is not immediately returned
+        CompletableFuture<RecordCursorResult<Integer>> resultFuture = cursor.onNext();
+        assertFalse(resultFuture.isDone());
+        futures.get(0).complete(1066);
+        RecordCursorResult<Integer> result = resultFuture.get();
+        assertTrue(result.hasNext());
+        assertEquals(1066, (int)result.get());
+        final RecordCursorContinuation lastContinuation = result.getContinuation();
+
+        // When the time limit is reached, we are still waiting on futures[1], so we don't get any more results.
+        resultFuture = cursor.onNext();
+        assertTrue(resultFuture.isDone());
+        result = resultFuture.get();
+        assertFalse(result.hasNext());
+        assertEquals(RecordCursor.NoNextReason.TIME_LIMIT_REACHED, result.getNoNextReason());
+        assertEquals(lastContinuation, result.getContinuation());
+
+        assertEquals(1, (int)RecordCursor.fromList(Arrays.asList(0, 1, 2, 3), lastContinuation.toBytes()).onNext().get().get());
+    }
+
+    /**
+     * Check the continuation returned when there is a time limit encountered while filling the pipeline of a
+     * map pipelined cursor. Here, make sure that if the first result to be returned after the time limit is reached
+     * is ready that we get that result back, but all future results (including any that were already ready) are not
+     * returned. Verify that the continuation matches the last <em>returned</em> result, which is different from the
+     * last result before the time limit is reached.
+     *
+     * @throws ExecutionException from futures joined in the test
+     * @throws InterruptedException from futures joined in the test
+     */
+    @Test
+    public void mapPipelinedContinuationWithTimeLimitWithMoreToReturn() throws ExecutionException, InterruptedException {
+        List<CompletableFuture<Integer>> futures = Arrays.asList(new CompletableFuture<>(), new CompletableFuture<>(), new CompletableFuture<>(), new CompletableFuture<>(), new CompletableFuture<>());
+        RecordCursor<Integer> cursor = new FakeOutOfBandCursor<>(RecordCursor.fromList(Arrays.asList(0, 1, 2, 3, 4)), 4).mapPipelined(futures::get, 4);
+        futures.get(1).complete(1415);
+        futures.get(3).complete(1807);
+        CompletableFuture<RecordCursorResult<Integer>> resultFuture = cursor.onNext();
+        assertFalse(resultFuture.isDone());
+        futures.get(0).complete(1066);
+        RecordCursorResult<Integer> result = resultFuture.get();
+        assertTrue(result.hasNext());
+        assertEquals(1066, (int)result.get());
+
+        // The time limit should be reached now by the pipelined cursor. As the second future has already completed,
+        // it will be returned. However, the fourth future, despite also being completed, should *not* be returned
+        // as there is an incomplete future in the middle.
+        resultFuture = cursor.onNext();
+        assertTrue(resultFuture.isDone());
+        result = resultFuture.get();
+        assertEquals(1415, (int)result.get());
+        final RecordCursorContinuation lastContinuation = result.getContinuation();
+
+        resultFuture = cursor.onNext();
+        assertTrue(resultFuture.isDone());
+        result = resultFuture.get();
+        assertFalse(result.hasNext());
+        assertEquals(RecordCursor.NoNextReason.TIME_LIMIT_REACHED, result.getNoNextReason());
+        assertEquals(lastContinuation, result.getContinuation());
+
+        assertEquals(2, (int)RecordCursor.fromList(Arrays.asList(0, 1, 2, 3, 4), lastContinuation.toBytes()).onNext().get().get());
+    }
+
+
+    /**
+     * Check the continuation returned when there is a time limit encountered while filling the pipeline of a
+     * map pipelined cursor. Here, make sure that if the time limit is reached on the very first element that we
+     * wait for the first future nonetheless (essentially to get a meaningful continuation). Validate that the
+     * continuation we get back is from the last returned result.
+     *
+     * @throws ExecutionException from futures joined in the test
+     * @throws InterruptedException from futures joined in the test
+     */
+    @Test
+    public void mapPipelinedContinuationWithTimeLimitBeforeFirstEntry() throws ExecutionException, InterruptedException {
+        List<CompletableFuture<Integer>> futures = Arrays.asList(new CompletableFuture<>(), new CompletableFuture<>(), new CompletableFuture<>());
+        futures.get(1).complete(1415);
+        RecordCursor<Integer> cursor = new FakeOutOfBandCursor<>(RecordCursor.fromList(Arrays.asList(0, 1, 2)), 2).mapPipelined(futures::get, 3);
+        CompletableFuture<RecordCursorResult<Integer>> resultFuture = cursor.onNext();
+        assertFalse(resultFuture.isDone());
+        futures.get(0).complete(1066);
+        RecordCursorResult<Integer> result = resultFuture.get();
+        assertTrue(result.hasNext());
+        assertEquals(1066, (int)result.get());
+
+        // The time limit has been reached, but futures[1] should already be in the pipeline so is returned
+        resultFuture = cursor.onNext();
+        assertTrue(resultFuture.isDone());
+        result = resultFuture.get();
+        assertTrue(result.hasNext());
+        assertEquals(1415, (int)result.get());
+        final RecordCursorContinuation lastContinuation = result.getContinuation();
+
+        // This should be the time limit being reached
+        resultFuture = cursor.onNext();
+        assertTrue(resultFuture.isDone());
+        result = resultFuture.get();
+        assertFalse(result.hasNext());
+        assertEquals(RecordCursor.NoNextReason.TIME_LIMIT_REACHED, result.getNoNextReason());
+        assertEquals(lastContinuation, result.getContinuation());
+
+        assertEquals(2, (int)RecordCursor.fromList(Arrays.asList(0, 1, 2), lastContinuation.toBytes()).onNext().get().get());
+    }
+
+    @Test
     public void lazyCursorTest() {
-        LazyCursor<Integer> cursor = new LazyCursor<>(
-                CompletableFuture.completedFuture(RecordCursor.fromList(Lists.newArrayList(1, 2, 3, 4, 5))));
+        RecordCursorIterator<Integer> cursor = new LazyCursor<>(
+                CompletableFuture.completedFuture(RecordCursor.fromList(Lists.newArrayList(1, 2, 3, 4, 5)))).asIterator();
         int i = 1;
         while (i <= 5 && cursor.hasNext()) {
             assertEquals(i, (int) cursor.next());
@@ -592,7 +813,7 @@ public class RecordCursorTest {
     public void lazyCursorExceptionTest() {
         LazyCursor<Integer> cursor = new LazyCursor<>(
                 CompletableFuture.supplyAsync( () -> { throw new IllegalArgumentException("Uh oh"); }));
-        assertThrows(RecordCoreException.class, () -> cursor.hasNext());
+        assertThrows(RecordCoreException.class, () -> cursor.getNext());
     }
 
     /**
@@ -629,10 +850,10 @@ public class RecordCursorTest {
         final List<Integer> list = Arrays.asList(1, 2, 3, 4, 5);
         RecordCursor<Integer> cursor = new FakeOutOfBandCursor<>(RecordCursor.fromList(list), 3);
         assertEquals(Arrays.asList(1, 2, 3), cursor.asList().join());
-        assertEquals(RecordCursor.NoNextReason.TIME_LIMIT_REACHED, cursor.getNoNextReason());
-        cursor = new FakeOutOfBandCursor<>(RecordCursor.fromList(list, cursor.getContinuation()), 3);
+        assertEquals(RecordCursor.NoNextReason.TIME_LIMIT_REACHED, cursor.getNext().getNoNextReason());
+        cursor = new FakeOutOfBandCursor<>(RecordCursor.fromList(list, cursor.getNext().getContinuation().toBytes()), 3);
         assertEquals(Arrays.asList(4, 5), cursor.asList().join());
-        assertEquals(RecordCursor.NoNextReason.SOURCE_EXHAUSTED, cursor.getNoNextReason());
+        assertEquals(RecordCursor.NoNextReason.SOURCE_EXHAUSTED, cursor.getNext().getNoNextReason());
     }
 
     @Test
@@ -642,15 +863,18 @@ public class RecordCursorTest {
         final Function<Integer, CompletableFuture<Integer>> map = i -> i != 2 ? CompletableFuture.completedFuture(i) : new CompletableFuture<>();
         RecordCursor<Integer> cursor = new FakeOutOfBandCursor<>(RecordCursor.fromList(list), 3).mapPipelined(map, 10);
         assertEquals(Arrays.asList(1), cursor.asList().join());
-        assertEquals(RecordCursor.NoNextReason.TIME_LIMIT_REACHED, cursor.getNoNextReason());
-        assertNotNull(cursor.getContinuation());
-        cursor = new FakeOutOfBandCursor<>(RecordCursor.fromList(list, cursor.getContinuation()), 3).mapPipelined(CompletableFuture::completedFuture, 10);
+        RecordCursorResult<Integer> noNextResult = cursor.getNext();
+        assertEquals(RecordCursor.NoNextReason.TIME_LIMIT_REACHED, noNextResult.getNoNextReason());
+        assertNotNull(noNextResult.getContinuation().toBytes());
+        cursor = new FakeOutOfBandCursor<>(RecordCursor.fromList(list, noNextResult.getContinuation().toBytes()), 3).mapPipelined(CompletableFuture::completedFuture, 10);
         assertEquals(Arrays.asList(2, 3, 4), cursor.asList().join());
-        assertEquals(RecordCursor.NoNextReason.TIME_LIMIT_REACHED, cursor.getNoNextReason());
-        cursor = new FakeOutOfBandCursor<>(RecordCursor.fromList(list, cursor.getContinuation()), 3).mapPipelined(CompletableFuture::completedFuture, 10);
+        noNextResult = cursor.getNext();
+        assertEquals(RecordCursor.NoNextReason.TIME_LIMIT_REACHED, noNextResult.getNoNextReason());
+        cursor = new FakeOutOfBandCursor<>(RecordCursor.fromList(list, noNextResult.getContinuation().toBytes()), 3).mapPipelined(CompletableFuture::completedFuture, 10);
         assertEquals(Arrays.asList(5), cursor.asList().join());
-        assertEquals(RecordCursor.NoNextReason.SOURCE_EXHAUSTED, cursor.getNoNextReason());
-        assertNull(cursor.getContinuation());
+        noNextResult = cursor.getNext();
+        assertEquals(RecordCursor.NoNextReason.SOURCE_EXHAUSTED, noNextResult.getNoNextReason());
+        assertNull(noNextResult.getContinuation().toBytes());
     }
 
     @Test
@@ -660,12 +884,14 @@ public class RecordCursorTest {
         final Function<Integer, CompletableFuture<Integer>> map = CompletableFuture::completedFuture;
         RecordCursor<Integer> cursor = new FakeOutOfBandCursor<>(RecordCursor.fromList(list), 3, RecordCursor.NoNextReason.SCAN_LIMIT_REACHED).mapPipelined(map, 10);
         assertEquals(Arrays.asList(1, 2, 3), cursor.asList().join());
-        assertEquals(RecordCursor.NoNextReason.SCAN_LIMIT_REACHED, cursor.getNoNextReason());
-        assertNotNull(cursor.getContinuation());
-        cursor = new FakeOutOfBandCursor<>(RecordCursor.fromList(list, cursor.getContinuation()), 3, RecordCursor.NoNextReason.SCAN_LIMIT_REACHED).mapPipelined(CompletableFuture::completedFuture, 10);
+        RecordCursorResult<Integer> noNextResult = cursor.getNext();
+        assertEquals(RecordCursor.NoNextReason.SCAN_LIMIT_REACHED, noNextResult.getNoNextReason());
+        assertNotNull(noNextResult.getContinuation().toBytes());
+        cursor = new FakeOutOfBandCursor<>(RecordCursor.fromList(list, noNextResult.getContinuation().toBytes()), 3, RecordCursor.NoNextReason.SCAN_LIMIT_REACHED).mapPipelined(CompletableFuture::completedFuture, 10);
         assertEquals(Arrays.asList(4, 5), cursor.asList().join());
-        assertEquals(RecordCursor.NoNextReason.SOURCE_EXHAUSTED, cursor.getNoNextReason());
-        assertNull(cursor.getContinuation());
+        noNextResult = cursor.getNext();
+        assertEquals(RecordCursor.NoNextReason.SOURCE_EXHAUSTED, noNextResult.getNoNextReason());
+        assertNull(noNextResult.getContinuation().toBytes());
     }
 
     @Test
@@ -676,29 +902,35 @@ public class RecordCursorTest {
         final Function<Integer, Boolean> filter = i -> i % 2 == 0;
         RecordCursor<Integer> cursor = new FakeOutOfBandCursor<>(RecordCursor.fromList(list), 1).filter(filter).mapPipelined(map, 10);
         assertEquals(Collections.emptyList(), cursor.asList().join());
-        assertEquals(RecordCursor.NoNextReason.TIME_LIMIT_REACHED, cursor.getNoNextReason());
-        assertNotNull(cursor.getContinuation());
-        cursor = new FakeOutOfBandCursor<>(RecordCursor.fromList(list, cursor.getContinuation()), 1).filter(filter).mapPipelined(map, 10);
+        RecordCursorResult<Integer> noNextResult = cursor.getNext();
+        assertEquals(RecordCursor.NoNextReason.TIME_LIMIT_REACHED, noNextResult.getNoNextReason());
+        assertNotNull(noNextResult.getContinuation().toBytes());
+        cursor = new FakeOutOfBandCursor<>(RecordCursor.fromList(list, noNextResult.getContinuation().toBytes()), 1).filter(filter).mapPipelined(map, 10);
         assertEquals(Arrays.asList(2), cursor.asList().join());
-        assertEquals(RecordCursor.NoNextReason.TIME_LIMIT_REACHED, cursor.getNoNextReason());
-        assertNotNull(cursor.getContinuation());
-        cursor = new FakeOutOfBandCursor<>(RecordCursor.fromList(list, cursor.getContinuation()), 1).filter(filter).mapPipelined(map, 10);
+        noNextResult = cursor.getNext();
+        assertEquals(RecordCursor.NoNextReason.TIME_LIMIT_REACHED, noNextResult.getNoNextReason());
+        assertNotNull(noNextResult.getContinuation().toBytes());
+        cursor = new FakeOutOfBandCursor<>(RecordCursor.fromList(list, noNextResult.getContinuation().toBytes()), 1).filter(filter).mapPipelined(map, 10);
         assertEquals(Collections.emptyList(), cursor.asList().join());
-        assertEquals(RecordCursor.NoNextReason.TIME_LIMIT_REACHED, cursor.getNoNextReason());
-        assertNotNull(cursor.getContinuation());
-        cursor = new FakeOutOfBandCursor<>(RecordCursor.fromList(list, cursor.getContinuation()), 1).filter(filter).mapPipelined(map, 10);
+        noNextResult = cursor.getNext();
+        assertEquals(RecordCursor.NoNextReason.TIME_LIMIT_REACHED, noNextResult.getNoNextReason());
+        assertNotNull(noNextResult.getContinuation().toBytes());
+        cursor = new FakeOutOfBandCursor<>(RecordCursor.fromList(list, noNextResult.getContinuation().toBytes()), 1).filter(filter).mapPipelined(map, 10);
         assertEquals(Arrays.asList(4), cursor.asList().join());
-        assertEquals(RecordCursor.NoNextReason.TIME_LIMIT_REACHED, cursor.getNoNextReason());
-        assertNotNull(cursor.getContinuation());
-        cursor = new FakeOutOfBandCursor<>(RecordCursor.fromList(list, cursor.getContinuation()), 1).filter(filter).mapPipelined(map, 10);
+        noNextResult = cursor.getNext();
+        assertEquals(RecordCursor.NoNextReason.TIME_LIMIT_REACHED, noNextResult.getNoNextReason());
+        assertNotNull(noNextResult.getContinuation().toBytes());
+        cursor = new FakeOutOfBandCursor<>(RecordCursor.fromList(list, noNextResult.getContinuation().toBytes()), 1).filter(filter).mapPipelined(map, 10);
         assertEquals(Collections.emptyList(), cursor.asList().join());
         // we've only just looked at the last element of the list so the cursor doesn't know that we've exhausted yet
-        assertEquals(RecordCursor.NoNextReason.TIME_LIMIT_REACHED, cursor.getNoNextReason());
-        assertNotNull(cursor.getContinuation());
-        cursor = new FakeOutOfBandCursor<>(RecordCursor.fromList(list, cursor.getContinuation()), 1).filter(filter).mapPipelined(map, 10);
+        noNextResult = cursor.getNext();
+        assertEquals(RecordCursor.NoNextReason.TIME_LIMIT_REACHED, noNextResult.getNoNextReason());
+        assertNotNull(noNextResult.getContinuation().toBytes());
+        cursor = new FakeOutOfBandCursor<>(RecordCursor.fromList(list, noNextResult.getContinuation().toBytes()), 1).filter(filter).mapPipelined(map, 10);
         assertEquals(Collections.emptyList(), cursor.asList().join());
-        assertEquals(RecordCursor.NoNextReason.SOURCE_EXHAUSTED, cursor.getNoNextReason());
-        assertNull(cursor.getContinuation());
+        noNextResult = cursor.getNext();
+        assertEquals(RecordCursor.NoNextReason.SOURCE_EXHAUSTED, noNextResult.getNoNextReason());
+        assertNull(noNextResult.getContinuation().toBytes());
     }
 
     @Test
@@ -715,17 +947,19 @@ public class RecordCursorTest {
         final Function<Integer, Boolean> filter = i -> i == 7;
         RecordCursor<Integer> cursor = new FakeOutOfBandCursor<>(RecordCursor.fromList(list).mapPipelined(delay, 1), 5).filter(filter).mapPipelined(map, 10);
         assertEquals(Collections.emptyList(), cursor.asList().join());
-        assertEquals(RecordCursor.NoNextReason.TIME_LIMIT_REACHED, cursor.getNoNextReason());
-        assertNotNull(cursor.getContinuation());
-        cursor = new FakeOutOfBandCursor<>(RecordCursor.fromList(list, cursor.getContinuation()).mapPipelined(delay, 1), 5).filter(filter).mapPipelined(map, 10);
+        RecordCursorResult<Integer> noNextResult = cursor.getNext();
+        assertEquals(RecordCursor.NoNextReason.TIME_LIMIT_REACHED, noNextResult.getNoNextReason());
+        assertNotNull(noNextResult.getContinuation().toBytes());
+        cursor = new FakeOutOfBandCursor<>(RecordCursor.fromList(list, noNextResult.getContinuation().toBytes()).mapPipelined(delay, 1), 5).filter(filter).mapPipelined(map, 10);
         assertEquals(Arrays.asList(7), cursor.asList().join());
         // may need to call hasNext() once more, to find out that we have really exhausted the cursor
-        if (cursor.getContinuation() != null) {
-            cursor = new FakeOutOfBandCursor<>(RecordCursor.fromList(list, cursor.getContinuation()).mapPipelined(delay, 1), 5).filter(filter).mapPipelined(map, 10);
+        noNextResult = cursor.getNext();
+        if (!noNextResult.getContinuation().isEnd()) {
+            cursor = new FakeOutOfBandCursor<>(RecordCursor.fromList(list, noNextResult.getContinuation().toBytes()).mapPipelined(delay, 1), 5).filter(filter).mapPipelined(map, 10);
         }
-        assertFalse(cursor.hasNext());
-        assertEquals(RecordCursor.NoNextReason.SOURCE_EXHAUSTED, cursor.getNoNextReason());
-        assertNull(cursor.getContinuation());
+        noNextResult = cursor.getNext();
+        assertEquals(RecordCursor.NoNextReason.SOURCE_EXHAUSTED, noNextResult.getNoNextReason());
+        assertNull(noNextResult.getContinuation().toBytes());
     }
 
     @Test
@@ -735,12 +969,14 @@ public class RecordCursorTest {
         final Function<Integer, Boolean> filter = i -> i % 2 == 0;
         RecordCursor<Integer> cursor = new FakeOutOfBandCursor<>(RecordCursor.fromList(list), 3).filter(filter).mapPipelined(map, 10);
         assertEquals(Arrays.asList(2), cursor.asList().join());
-        assertEquals(RecordCursor.NoNextReason.TIME_LIMIT_REACHED, cursor.getNoNextReason());
-        assertNotNull(cursor.getContinuation());
-        cursor = new FakeOutOfBandCursor<>(RecordCursor.fromList(list, cursor.getContinuation()), 3).filter(filter).mapPipelined(map, 10);
+        RecordCursorResult<Integer> noNextResult = cursor.getNext();
+        assertEquals(RecordCursor.NoNextReason.TIME_LIMIT_REACHED, noNextResult.getNoNextReason());
+        assertNotNull(noNextResult.getContinuation());
+        cursor = new FakeOutOfBandCursor<>(RecordCursor.fromList(list, noNextResult.getContinuation().toBytes()), 3).filter(filter).mapPipelined(map, 10);
         assertEquals(Arrays.asList(4), cursor.asList().join());
-        assertEquals(RecordCursor.NoNextReason.SOURCE_EXHAUSTED, cursor.getNoNextReason());
-        assertNull(cursor.getContinuation());
+        noNextResult = cursor.getNext();
+        assertEquals(RecordCursor.NoNextReason.SOURCE_EXHAUSTED, noNextResult.getNoNextReason());
+        assertNull(noNextResult.getContinuation().toBytes());
     }
 
     @Test
@@ -753,22 +989,28 @@ public class RecordCursorTest {
         final BiFunction<Integer, byte[], RecordCursor<Integer>> timedInner = baseInner.andThen(cursor -> new FakeOutOfBandCursor<>(cursor, 3));
         RecordCursor<Integer> cursor = RecordCursor.flatMapPipelined(outer, timedInner, null, 10);
         assertEquals(Arrays.asList(11, 12, 13), cursor.asList().join());
-        assertEquals(RecordCursor.NoNextReason.TIME_LIMIT_REACHED, cursor.getNoNextReason());
-        cursor = RecordCursor.flatMapPipelined(outer, timedInner, cursor.getContinuation(), 10);
+        RecordCursorResult<Integer> noNextResult = cursor.getNext();
+        assertEquals(RecordCursor.NoNextReason.TIME_LIMIT_REACHED, noNextResult.getNoNextReason());
+        cursor = RecordCursor.flatMapPipelined(outer, timedInner, noNextResult.getContinuation().toBytes(), 10);
         assertEquals(Arrays.asList(14, 15, 21, 22, 23), cursor.asList().join());
-        assertEquals(RecordCursor.NoNextReason.TIME_LIMIT_REACHED, cursor.getNoNextReason());
-        cursor = RecordCursor.flatMapPipelined(outer, timedInner, cursor.getContinuation(), 10);
+        noNextResult = cursor.getNext();
+        assertEquals(RecordCursor.NoNextReason.TIME_LIMIT_REACHED, noNextResult.getNoNextReason());
+        cursor = RecordCursor.flatMapPipelined(outer, timedInner, noNextResult.getContinuation().toBytes(), 10);
         assertEquals(Arrays.asList(24, 25, 31, 32, 33), cursor.asList().join());
-        assertEquals(RecordCursor.NoNextReason.TIME_LIMIT_REACHED, cursor.getNoNextReason());
-        cursor = RecordCursor.flatMapPipelined(outer, timedInner, cursor.getContinuation(), 10);
+        noNextResult = cursor.getNext();
+        assertEquals(RecordCursor.NoNextReason.TIME_LIMIT_REACHED, noNextResult.getNoNextReason());
+        cursor = RecordCursor.flatMapPipelined(outer, timedInner, noNextResult.getContinuation().toBytes(), 10);
         assertEquals(Arrays.asList(34, 35, 41, 42, 43), cursor.asList().join());
-        assertEquals(RecordCursor.NoNextReason.TIME_LIMIT_REACHED, cursor.getNoNextReason());
-        cursor = RecordCursor.flatMapPipelined(outer, timedInner, cursor.getContinuation(), 10);
+        noNextResult = cursor.getNext();
+        assertEquals(RecordCursor.NoNextReason.TIME_LIMIT_REACHED, noNextResult.getNoNextReason());
+        cursor = RecordCursor.flatMapPipelined(outer, timedInner, noNextResult.getContinuation().toBytes(), 10);
         assertEquals(Arrays.asList(44, 45, 51, 52, 53), cursor.asList().join());
-        assertEquals(RecordCursor.NoNextReason.TIME_LIMIT_REACHED, cursor.getNoNextReason());
-        cursor = RecordCursor.flatMapPipelined(outer, timedInner, cursor.getContinuation(), 10);
+        noNextResult = cursor.getNext();
+        assertEquals(RecordCursor.NoNextReason.TIME_LIMIT_REACHED, noNextResult.getNoNextReason());
+        cursor = RecordCursor.flatMapPipelined(outer, timedInner, noNextResult.getContinuation().toBytes(), 10);
         assertEquals(Arrays.asList(54, 55), cursor.asList().join());
-        assertEquals(RecordCursor.NoNextReason.SOURCE_EXHAUSTED, cursor.getNoNextReason());
+        noNextResult = cursor.getNext();
+        assertEquals(RecordCursor.NoNextReason.SOURCE_EXHAUSTED, noNextResult.getNoNextReason());
     }
 
     @Test
@@ -780,12 +1022,14 @@ public class RecordCursorTest {
                 .filter(i -> false)
                 .orElse(orElse);
         assertEquals(Collections.emptyList(), cursor.asList().join());
-        assertEquals(RecordCursor.NoNextReason.TIME_LIMIT_REACHED, cursor.getNoNextReason());
-        cursor = new FakeOutOfBandCursor<>(RecordCursor.fromList(list, cursor.getContinuation()), 3)
+        RecordCursorResult<Integer> noNextResult = cursor.getNext();
+        assertEquals(RecordCursor.NoNextReason.TIME_LIMIT_REACHED, noNextResult.getNoNextReason());
+        cursor = new FakeOutOfBandCursor<>(RecordCursor.fromList(list, noNextResult.getContinuation().toBytes()), 3)
                 .filter(i -> false)
                 .orElse(orElse);
         assertEquals(Collections.singletonList(0), cursor.asList().join());
-        assertEquals(RecordCursor.NoNextReason.SOURCE_EXHAUSTED, cursor.getNoNextReason());
+        noNextResult = cursor.getNext();
+        assertEquals(RecordCursor.NoNextReason.SOURCE_EXHAUSTED, noNextResult.getNoNextReason());
     }
 
     static class BrokenCursor implements RecordCursor<String> {
@@ -799,23 +1043,28 @@ public class RecordCursorTest {
 
         @Nonnull
         @Override
+        @Deprecated
         public CompletableFuture<Boolean> onHasNext() {
             return onNext().thenApply(RecordCursorResult::hasNext);
         }
 
         @Nullable
         @Override
+        @Deprecated
         public String next() {
             throw new NoSuchElementException();
         }
 
         @Nullable
         @Override
+        @Deprecated
         public byte[] getContinuation() {
             return null;
         }
 
+        @Nonnull
         @Override
+        @Deprecated
         public NoNextReason getNoNextReason() {
             return NoNextReason.SOURCE_EXHAUSTED;
         }

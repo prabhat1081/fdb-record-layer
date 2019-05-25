@@ -20,7 +20,7 @@
 
 package com.apple.foundationdb.record;
 
-import com.apple.foundationdb.API;
+import com.apple.foundationdb.annotation.API;
 import com.apple.foundationdb.ReadTransaction;
 
 import javax.annotation.Nonnull;
@@ -123,8 +123,36 @@ public class ExecuteProperties {
         return copy(skip, newLimit, timeLimit, isolationLevel, state, failOnScanLimitReached, defaultCursorStreamingMode);
     }
 
+    /**
+     * Get the time limit for query execution. This will return {@link #UNLIMITED_TIME} if there is no time-limit
+     * imposed on a query.
+     *
+     * @return the maximum time for query execution
+     */
     public long getTimeLimit() {
         return timeLimit;
+    }
+
+    /**
+     * Get the maximum number of records a query with this execute properties will scan. This will return
+     * {@link Integer#MAX_VALUE} if there is no limit to the number of records scanned by a query.
+     *
+     * @return the maximum number of records a query will scan
+     */
+    public int getScannedRecordsLimit() {
+        final RecordScanLimiter recordScanLimiter = getState().getRecordScanLimiter();
+        return recordScanLimiter == null ? Integer.MAX_VALUE : recordScanLimiter.getLimit();
+    }
+
+    /**
+     * Get the maximum number of bytes a query with this execute properties will scan. This will return
+     * {@link Long#MAX_VALUE} if there is no limit to the number of bytes scanned by a query.
+     *
+     * @return the maximum number of bytes a query will scan
+     */
+    public long getScannedBytesLimit() {
+        final ByteScanLimiter byteScanLimiter = getState().getByteScanLimiter();
+        return byteScanLimiter == null ? Long.MAX_VALUE : byteScanLimiter.getLimit();
     }
 
     @Nonnull

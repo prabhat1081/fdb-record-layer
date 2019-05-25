@@ -35,10 +35,15 @@ public class TestKeySpace {
             new DirectoryLayerDirectory("record-test", "record-test")
                     .addSubdirectory(new DirectoryLayerDirectory("unit", "unit")
                             .addSubdirectory(new DirectoryLayerDirectory("recordStore", "recordStore"))
+                            .addSubdirectory(new DirectoryLayerDirectory("corruptRecordStore", "corruptRecordStore"))
+                            .addSubdirectory(new DirectoryLayerDirectory("multiRecordStore", "multiRecordStore")
+                                    .addSubdirectory(new DirectoryLayerDirectory("storePath"))
+                            )
                             .addSubdirectory(new DirectoryLayerDirectory("metadataStore", "metadataStore"))
                             .addSubdirectory(new DirectoryLayerDirectory("keyvaluecursor", "keyvaluecursor"))
                             .addSubdirectory(new DirectoryLayerDirectory("ackeyvaluecursor", "ackeyvaluecursor"))
                             .addSubdirectory(new DirectoryLayerDirectory("typedtest", "typedtest"))
+                            .addSubdirectory(new DirectoryLayerDirectory("concatcursor", "concatcursor"))
                             .addSubdirectory(new DirectoryLayerDirectory("indexTest", "indexTest")
                                     .addSubdirectory(new KeySpaceDirectory("leaderboard", KeySpaceDirectory.KeyType.LONG, 8L))
                                     .addSubdirectory(new KeySpaceDirectory("version", KeySpaceDirectory.KeyType.LONG, 9L))
@@ -63,5 +68,4 @@ public class TestKeySpace {
         }
         return path;
     }
-
 }

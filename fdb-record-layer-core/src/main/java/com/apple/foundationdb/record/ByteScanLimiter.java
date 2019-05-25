@@ -20,7 +20,7 @@
 
 package com.apple.foundationdb.record;
 
-import com.apple.foundationdb.API;
+import com.apple.foundationdb.annotation.API;
 
 import javax.annotation.Nonnull;
 import java.util.concurrent.atomic.AtomicLong;
@@ -64,6 +64,16 @@ public class ByteScanLimiter {
      */
     public void registerScannedBytes(long bytes) {
         bytesRemaining.addAndGet(-bytes);
+    }
+
+    /**
+     * Get the byte scan limit. In particular, this will return the target
+     * number of bytes that this limiter is being used to enforce.
+     *
+     * @return the byte scan limit being enforced
+     */
+    public long getLimit() {
+        return originalLimit;
     }
 
     @Override
